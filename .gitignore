@@ -1,0 +1,16 @@
+.cursor
+.venv
+depth-anything-3/
+vggt/
+mast3r/
+nerf
+reconstruction/
+reconstruction_3dgs/
+outputs/
+checkpoints/
+*.ckpt
+*.pth
+*.pt
+*.npz
+*.ply
+*.ckpt
