@@ -430,7 +430,7 @@ def main():
 
     rr.init("SpectraBreast_3DGS")
     rr.serve_grpc(grpc_port=args.grpc_port)
-
+    input("Press Enter to continue...")
     # 3DGS init (bounds from camera spread so plot range matches pose scale)
     bb_min, bb_max = estimate_scene_bounds_from_cameras(poses_tensor_prem)
     extent = (bb_max - bb_min).cpu().numpy()
