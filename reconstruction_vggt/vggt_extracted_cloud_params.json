@@ -1,0 +1,52 @@
+{
+  "rgb_dir": "rgb_images",
+  "pose_dir": "camera_poses",
+  "camera_params_dir": "camera_parameters",
+  "out_dir": "reconstruction_vggt",
+  "model_name": "facebook/VGGT-1B",
+  "image_size": 518,
+  "conf_thres_percentile": 90.0,
+  "cloud_source": "depth_map",
+  "camera_source": "gt",
+  "alignment_mode": "sim3",
+  "num_images": 20,
+  "num_points_output": 406803,
+  "pointcloud_units": "meters",
+  "output_ply": "reconstruction_vggt/vggt_extracted_cloud.ply",
+  "output_npz": "reconstruction_vggt/vggt_extracted_cloud.npz",
+  "output_camera_poses": "reconstruction_vggt/camera_poses_output_frame.npy",
+  "output_reconstruction_camera_poses": "reconstruction_vggt/camera_poses_reconstruction.npy",
+  "output_predicted_intrinsics": "reconstruction_vggt/intrinsics_predicted.npy",
+  "output_gt_network_intrinsics": "reconstruction_vggt/intrinsics_gt_network_geometry.npy",
+  "output_confidence_dir": "reconstruction_vggt/confidence_maps",
+  "camera2ee_used": "camera_parameters/camera2ee.npy",
+  "predicted_to_gt_similarity_path": "reconstruction_vggt/predicted_to_gt_similarity.npy",
+  "alignment_info": {
+    "mode": "sim3",
+    "scale": 0.2118310036173614,
+    "rotation_matrix": [
+      [
+        0.5409285426139832,
+        0.7881421446800232,
+        0.2936466336250305
+      ],
+      [
+        0.8404703140258789,
+        -0.5196950435638428,
+        -0.15338434278964996
+      ],
+      [
+        0.031718041747808456,
+        0.3297712206840515,
+        -0.94352787733078
+      ]
+    ],
+    "translation": [
+      -0.4535561800003052,
+      0.3431929349899292,
+      0.24185414612293243
+    ],
+    "camera_center_rmse_before_m": 0.5563003317156386,
+    "camera_center_rmse_after_m": 0.008955224450914845
+  }
+}
