@@ -53,16 +53,30 @@ python vggt_pipeline.py
 | <code>--grpc_port</code> | <code>9876</code> | Rerun gRPC port |
 | <code>--no_wait</code> | off | Do not wait for user input after logging to Rerun |
 
+**RGB-only mode**
+
+Both the pose directory (<code>--pose_dir</code>) and the camera intrinsics file
+(<code>&lt;camera_params_dir&gt;/intrinsics.npy</code>) are optional. If either is
+missing, the script automatically falls back to VGGT's own predicted cameras
+and intrinsics. When no GT poses are available, <code>--camera_source gt</code>
+is silently downgraded to <code>predicted</code>.
+
 **Examples**
 ```bash
-# Defaults (predicted frame, depth-map unprojection)
+# Defaults (GT poses + intrinsics if present, predicted frame, depth-map unprojection)
 python vggt_pipeline.py
 
-# Align reconstruction to GT robot frame (Sim3)
+# Align reconstruction to GT robot frame (Sim3) - needs poses + intrinsics
 python vggt_pipeline.py --camera_source gt
 
-# Use point-map branch, custom output dir, skip interactive wait
-python vggt_pipeline.py --cloud_source depth_map --camera_source gt --alignment_mode=sim3 --conf_thres=90.0
+# Use point-map branch, align to GT, stricter confidence filtering
+python vggt_pipeline.py --cloud_source point_map --camera_source gt --alignment_mode sim3 --conf_thres 90.0
+
+# RGB-only: pass a directory that only contains rgb_images/, no poses, no intrinsics
+python vggt_pipeline.py --rgb_dir my_rgb_only/rgb_images --pose_dir /non/existent --camera_params_dir /non/existent --out_dir reconstruction_vggt_rgb_only
+
+# RGB-only, keep point map branch, mask bright background, non-interactive
+python vggt_pipeline.py --rgb_dir my_rgb_only/rgb_images --pose_dir /non/existent --camera_params_dir /non/existent --cloud_source point_map --mask_white_bg --no_wait
 ```
 
 
@@ -108,40 +122,31 @@ python mast3r_pipeline.py
 | <code>--grpc_port</code>        | <code>9876</code>          | Rerun gRPC port                                                                        |
 | <code>--no_wait</code>          | off               | Do not wait for user input after logging to Rerun                                      |
 
-**Examples**
-```bash
-# Defaults
-python mast3r_pipeline.py
+**RGB-only mode**
 
-# Custom output dir and stronger alignment
-| Argument | Default | Description |
-|----------|---------|-------------|
-| `--rgb_dir` | `rgb_images/` | Directory of RGB images (`image_*.png`) |
-| `--pose_dir` | `camera_poses/` | Directory of camera pose files (`pose_*.txt`) |
-| `--out_dir` | `reconstruction` | Output directory for PLY and params JSON |
-| `--image_size` | `512` | Image size for MASt3R (longer side) |
-| `--scene_graph` | *(auto)* | `complete`, `swin-N`, `logwin-N`; empty = auto (complete if &lt;40 images else swin-5) |
-| `--subsample` | `4` | Dense grid step: `1`, `2`, `4`, or `8`. Smaller = finer/smoother (less 8×8 blockiness), larger = faster |
-| `--lr1` | `0.07` | Coarse alignment learning rate |
-| `--niter1` | `300` | Coarse alignment iterations |
-| `--lr2` | `0.01` | Fine refinement learning rate |
-| `--niter2` | `300` | Fine refinement iterations |
-| `--opt_depth` | on | Optimize depth in alignment (use `--no_opt_depth` to disable) |
-| `--shared_intrinsics` | on | Shared intrinsics across views (use `--no_shared_intrinsics` to disable) |
-| `--matching_conf_thr` | `5.0` | Matching confidence threshold before fallback |
-| `--min_conf_thr` | `1.5` | Min confidence to keep a point in the output cloud |
-| `--max_points` | `2000000` | Max points to keep (subsample if exceeded) |
-| `--grpc_port` | `9876` | Rerun gRPC port |
-| `--no_wait` | off | Do not wait for user input after logging to Rerun |
+Both the pose directory (<code>--pose_dir</code>) and the camera intrinsics
+file (<code>&lt;camera_params_dir&gt;/intrinsics.npy</code>) are optional. If
+either is missing, the script:
+
+1. Skips the epipolar pose refinement step (it needs GT poses as initialization and GT intrinsics to compute the essential matrix).
+2. Initializes the MASt3R global aligner with a minimum-spanning-tree (<code>init="mst"</code>) instead of <code>known_poses</code>.
+3. Lets the aligner estimate per-image focals and principal points.
 
 **Examples**
 ```bash
-# Defaults
+# Defaults: GT poses + GT intrinsics drive refinement and dense alignment
 python mast3r_pipeline.py
 
-# Custom output dir and stronger alignment
-python mast3r_pipeline.py --out_dir reconstruction_run2 --niter1 300 --niter2 300 --min_conf_thr 2.0
+# Stronger confidence filtering and a custom output dir
+python mast3r_pipeline.py --out_dir reconstruction_run2 --dense_conf_thr 6 --voxel_size 0.001
 
-# Force complete scene graph, skip interactive wait
-python mast3r_pipeline.py --scene_graph complete --no_wait
+# Wider temporal window for more pairs, non-interactive
+python mast3r_pipeline.py --neighbor_window 3 --no_wait
+
+# RGB-only: no pose_dir, no intrinsics file. MASt3R estimates both.
+python mast3r_pipeline.py --rgb_dir my_rgb_only/rgb_images --pose_dir /non/existent --camera_params_dir /non/existent --out_dir reconstruction_mast3r_rgb_only
+
+# RGB-only with more pairs per image and non-interactive
+python mast3r_pipeline.py --rgb_dir my_rgb_only/rgb_images --pose_dir /non/existent --camera_params_dir /non/existent --neighbor_window 4 --dense_conf_thr 6 --no_wait
 ```
+</details>

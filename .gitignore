@@ -14,3 +14,5 @@ checkpoints/
 *.npz
 *.ply
 *.ckpt
+DATA/
+reconstruction*/

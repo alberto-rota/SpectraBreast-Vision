@@ -965,41 +965,69 @@ def main():
 
     _log_step("Step 1/8 - Loading RGB images, poses, and calibration")
     image_files = sorted(args.rgb_dir.glob("image_*.png"))
-    pose_files = sorted(args.pose_dir.glob("pose_*.txt"))
+    pose_files = sorted(args.pose_dir.glob("pose_*.txt")) if args.pose_dir.exists() else []
     if len(image_files) == 0:
         raise RuntimeError(f"No images found in {args.rgb_dir}")
-    if len(image_files) != len(pose_files):
-        raise RuntimeError(f"Found {len(image_files)} images but {len(pose_files)} pose files")
     if len(image_files) < 2:
         raise RuntimeError("This reconstruction pipeline needs at least two images.")
 
+    # GT poses are optional - if missing, we let MASt3R estimate them via MST init.
+    have_gt_poses = len(pose_files) == len(image_files)
+    if len(pose_files) > 0 and not have_gt_poses:
+        print(
+            f"[yellow]Found {len(image_files)} images but {len(pose_files)} pose files; "
+            "ignoring pose files and running in RGB-only mode.[/yellow]"
+        )
+    elif len(pose_files) == 0:
+        print(
+            "[yellow]No pose files found; MASt3R will estimate camera poses from scratch.[/yellow]"
+        )
+
     orig_images = [io.read_image(str(path)) for path in image_files]  # [3,H,W], uint8, CPU
-    poses6 = []
-    for pose_file in pose_files:
-        pose_values = [float(x) for x in pose_file.read_text().strip().split()]
-        poses6.append(pose_values)
-    poses6 = torch.tensor(poses6, dtype=torch.float32, device=device)  # [N,6]
 
-    T_world_ee = xyzeuler_to_hmat(
-        poses6,
-        convention="ROLLPITCHYAW",
-        translation_scale=1.0,
-    )  # [N,4,4], assumed to be in meters.
-
-    K_orig = np.load(args.camera_params_dir / "intrinsics.npy").astype(np.float32)
+    # GT intrinsics are optional - if missing, MASt3R will estimate focals/principal points.
+    intrinsics_path = args.camera_params_dir / "intrinsics.npy"
     cam2ee_path = args.camera_params_dir / "camera2ee.npy"
-    if cam2ee_path.exists():
-        T_ee_cam = _fix_3x4_to_4x4(np.load(cam2ee_path))
-        print(f"Loaded camera-to-EE transform from [green]{cam2ee_path}[/green]")
+    have_gt_intrinsics = intrinsics_path.exists()
+    if have_gt_intrinsics:
+        K_orig = np.load(intrinsics_path).astype(np.float32)
     else:
-        T_ee_cam = np.eye(4, dtype=np.float32)
-        print("[yellow]camera2ee.npy not found, assuming poses are already camera poses.[/yellow]")
+        K_orig = None
+        print(
+            f"[yellow]{intrinsics_path} not found; MASt3R will estimate intrinsics.[/yellow]"
+        )
 
-    T_ee_cam_t = (
-        torch.tensor(T_ee_cam, dtype=torch.float32, device=device).unsqueeze(0).repeat(len(poses6), 1, 1)
-    )  # [N,4,4]
-    T_world_cam_init = torch.matmul(T_world_ee, T_ee_cam_t).detach().cpu().numpy().astype(np.float32)
-    print(f"Loaded {len(image_files)} images and {len(pose_files)} poses")
+    if have_gt_poses:
+        poses6 = []
+        for pose_file in pose_files:
+            pose_values = [float(x) for x in pose_file.read_text().strip().split()]
+            poses6.append(pose_values)
+        poses6 = torch.tensor(poses6, dtype=torch.float32, device=device)  # [N,6]
+
+        T_world_ee = xyzeuler_to_hmat(
+            poses6,
+            convention="ROLLPITCHYAW",
+            translation_scale=1.0,
+        )  # [N,4,4], assumed to be in meters.
+
+        if cam2ee_path.exists():
+            T_ee_cam = _fix_3x4_to_4x4(np.load(cam2ee_path))
+            print(f"Loaded camera-to-EE transform from [green]{cam2ee_path}[/green]")
+        else:
+            T_ee_cam = np.eye(4, dtype=np.float32)
+            print("[yellow]camera2ee.npy not found, assuming poses are already camera poses.[/yellow]")
+
+        T_ee_cam_t = (
+            torch.tensor(T_ee_cam, dtype=torch.float32, device=device).unsqueeze(0).repeat(len(poses6), 1, 1)
+        )  # [N,4,4]
+        T_world_cam_init = torch.matmul(T_world_ee, T_ee_cam_t).detach().cpu().numpy().astype(np.float32)
+    else:
+        T_world_cam_init = None
+
+    print(
+        f"Loaded {len(image_files)} images"
+        + (f" and {len(pose_files)} poses" if have_gt_poses else " (RGB-only)")
+    )
 
     _log_step("Step 2/8 - Initializing Rerun and loading the MASt3R model")
     rr.init("SpectraBreast_MASt3R_MetricDenseFusion")
@@ -1030,7 +1058,11 @@ def main():
         _compute_image_geometry(image, image_size=args.image_size, patch_size=patch_size, square_ok=False)
         for image in orig_images
     ]
-    K_network = [geom.original_to_network_intrinsics(K_orig) for geom in geometries]
+    K_network = (
+        [geom.original_to_network_intrinsics(K_orig) for geom in geometries]
+        if have_gt_intrinsics
+        else None
+    )
 
     for image_idx, (geom, img_net) in enumerate(zip(geometries, imgs_mast3r)):
         net_h, net_w = map(int, img_net["img"].shape[-2:])
@@ -1087,15 +1119,26 @@ def main():
     multiple_shapes = not _pairs_share_same_network_shape(pairs)
     compact_output = collate_with_cat(compact_pair_results, lists=multiple_shapes)
 
-    refined_poses, pose_stats = _refine_camera_poses_with_epipolar(
-        match_records=match_records,
-        T_world_cam_init_np=T_world_cam_init,
-        K_orig=K_orig,
-        args=args,
-        device=device,
-    )
+    if have_gt_poses and have_gt_intrinsics:
+        refined_poses, pose_stats = _refine_camera_poses_with_epipolar(
+            match_records=match_records,
+            T_world_cam_init_np=T_world_cam_init,
+            K_orig=K_orig,
+            args=args,
+            device=device,
+        )
+    else:
+        # Epipolar pose refinement requires both GT poses (initialization) and
+        # GT intrinsics (to build the essential matrix). Skip it otherwise.
+        refined_poses = T_world_cam_init  # may be None
+        pose_stats = {
+            "pairs_used": len(match_records),
+            "matches_used": int(sum(len(rec["conf"]) for rec in match_records)),
+            "used_alignment": False,
+            "note": "Skipped epipolar refinement (RGB-only mode or missing intrinsics)",
+        }
 
-    _log_step("Step 5/8 - Running dense MASt3R fusion with fixed refined poses and exact intrinsics")
+    _log_step("Step 5/8 - Running dense MASt3R fusion")
     _patch_modular_optimizer()
     scene = global_aligner(
         compact_output,
@@ -1103,20 +1146,32 @@ def main():
         mode=GlobalAlignerMode.ModularPointCloudOptimizer,
         verbose=True,
         min_conf_thr=args.dense_conf_thr,
-        fx_and_fy=True,
+        # fx_and_fy requires both focals to be preset exactly; only enable with GT K.
+        fx_and_fy=bool(have_gt_intrinsics),
     )
 
-    refined_poses_t = torch.tensor(refined_poses, dtype=torch.float32, device=device)
-    scene.preset_pose(refined_poses_t)
-    _preset_exact_intrinsics(scene.cpu(), K_network)
+    if have_gt_poses:
+        refined_poses_t = torch.tensor(refined_poses, dtype=torch.float32, device=device)
+        scene.preset_pose(refined_poses_t)
+    if have_gt_intrinsics:
+        _preset_exact_intrinsics(scene.cpu(), K_network)
 
+    dense_init = "known_poses" if have_gt_poses else "mst"
     dense_loss = scene.compute_global_alignment(
-        init="known_poses",
+        init=dense_init,
         niter=args.dense_refine_iters,
         schedule="cosine",
         lr=args.dense_refine_lr,
     )
     print(f"[green]Dense MASt3R optimization finished with final loss {float(dense_loss):.6f}[/green]")
+
+    # After alignment, always export the cameras that MASt3R actually used for
+    # fusion. In RGB-only mode these are MASt3R's estimated cam-to-world poses.
+    with torch.no_grad():
+        refined_poses = scene.get_im_poses().detach().cpu().numpy().astype(np.float32)
+        scene_intrinsics_network = scene.get_intrinsics().detach().cpu().numpy().astype(np.float32)
+    if K_network is None:
+        K_network = [K for K in scene_intrinsics_network]
 
     _log_step("Step 6/8 - Cleaning the dense reconstruction and building a single fused point cloud")
     scene = scene.clean_pointcloud()
@@ -1171,11 +1226,19 @@ def main():
                 mat3x3=T_world_cam[:3, :3],
             ),
         )
+        if have_gt_intrinsics:
+            pinhole_K = K_orig
+            pinhole_res = [geom.original_width, geom.original_height]
+        else:
+            # In RGB-only mode MASt3R intrinsics live in the network crop geometry,
+            # so log against the network-resolution image.
+            pinhole_K = np.asarray(K_network[image_idx], dtype=np.float32)
+            pinhole_res = [geom.network_width, geom.network_height]
         rr.log(
             f"/cameras/{image_idx}/image",
             rr.Pinhole(
-                image_from_camera=K_orig,
-                resolution=[geom.original_width, geom.original_height],
+                image_from_camera=pinhole_K,
+                resolution=pinhole_res,
                 image_plane_distance=0.01,
             ),
         )
@@ -1249,7 +1312,10 @@ def main():
         "per_image_dense_point_counts": fusion_result["per_image_counts"],
         "fallback_view_indices": fusion_result["fallback_view_indices"],
         "pose_refinement": pose_stats,
-        "camera2ee_used": str(cam2ee_path) if cam2ee_path.exists() else None,
+        "have_gt_poses": bool(have_gt_poses),
+        "have_gt_intrinsics": bool(have_gt_intrinsics),
+        "dense_init": dense_init,
+        "camera2ee_used": str(cam2ee_path) if (have_gt_poses and cam2ee_path.exists()) else None,
     }
     with open(params_path, "w") as f:
         json.dump(params, f, indent=2)
