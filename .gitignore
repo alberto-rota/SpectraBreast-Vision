@@ -15,4 +15,4 @@ checkpoints/
 *.ply
 *.ckpt
 DATA/
-reconstruction*/
+RESULTS/

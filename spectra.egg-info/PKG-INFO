@@ -1,3 +1,11 @@
+Metadata-Version: 2.4
+Name: spectra
+Version: 0.1.0
+Summary: ArUco-stabilized 3D reconstruction pipeline (VGGT | MASt3R) with a unified CLI, TUI, and Python API.
+Author: SpectraBreast
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+
 # SpectraBreast Sample 3D Reconstruction 
 
 ### Repository Structure
@@ -24,42 +32,25 @@ Three equivalent ways to drive it:
 - **TUI**: `spectra tui` (Textual; sample browser + YAML editor + live log)
 - **API**: `from spectra import run_reconstruction, load_config, ReconstructionConfig`
 
-### Installation (with [`uv`](https://docs.astral.sh/uv/))
+### Installation
 
 ```bash
-# Clone the repo
+# Clone and create a virtualenv
 git clone <this-repo> spectra && cd spectra
+python3 -m venv .venv && source .venv/bin/activate
 
-# Create the project venv (uv reads `requires-python` from pyproject.toml)
-uv venv
+# Install all pinned dependencies (torch, opencv, rerun, textual, typer, pydantic, ...)
+pip install -r requirements.txt
 
-# Seed the environment with all pinned, CUDA-built dependencies
-uv pip install -r requirements.txt
-
-# Register the `spectra` console script (no re-resolve of the pinned deps)
-uv pip install -e . --no-deps
-
-# Activate the env so that `spectra ...` works directly
-source .venv/bin/activate
+# Register the `spectra` console script (no re-resolve of pinned deps)
+pip install -e . --no-deps
 
 # Sanity-check the CLI
 spectra --help
 ```
 
-If you'd rather not activate the env, every recipe below also works as
-`uv run spectra <subcommand> ...` (uv injects the project venv for you).
-
-> **Why `uv pip` and not `uv sync`?** The heavy CUDA-pinned dependencies
-> (`torch==2.10.0+cu130`, `faiss-gpu-cu12`, the editable `mast3r/asmk`
-> submodule, ...) are tracked in `requirements.txt`, not in `pyproject.toml`.
-> `uv sync` would try to resolve an empty dependency set and wipe them.
-> `uv pip install -r requirements.txt` + `uv pip install -e . --no-deps`
-> gives you the same speed gains without touching the pinned set.
-
-> **Plain pip works too.** If you don't have `uv`, replace each `uv pip ...`
-> with `pip ...` and skip the `uv venv` step in favour of
-> `python3 -m venv .venv && source .venv/bin/activate`. Without an activated
-> env, use `python -m spectra ...` in place of `spectra ...`.
+> If you prefer not to install the package, every `spectra ...` command below also
+> works as `python -m spectra ...` from the repo root.
 
 ### Expected input layout
 
@@ -186,29 +177,6 @@ The TUI has three panes:
 - **Right** — live stdout/stderr of the running pipeline + status bar.
 
 The pipeline runs in a background thread, so the UI stays responsive while VGGT or MASt3R crunches.
-
-### CLI — `spectra viewer` (local 3D viewer)
-
-A minimal Gradio app that lets you inspect any finished run in the browser. It streams a single GLB containing the fused RGB point cloud + all triangulated ArUco markers (per-ID colored quads), optionally overlaid on the surface mesh.
-
-```bash
-# Browse ./RESULTS on http://127.0.0.1:7860 and pick a run from the dropdown
-spectra viewer
-
-# Custom results folder / port, no auto-open browser
-spectra viewer --results-dir RESULTS --port 7861 --no-browser
-
-# Expose a temporary public Gradio share link (off by default)
-spectra viewer --share
-```
-
-Controls inside the app:
-
-- **Run** dropdown — lists every subfolder of `--results-dir` containing a `cloud.npz` (newest first). `Refresh list` rescans the folder.
-- **Max points** slider — uniformly subsamples the cloud before sending it to the browser. Keep ~150k for smooth interaction; bump up for visual fidelity.
-- **Overlay surface mesh** — also renders `surface_mesh.ply` if present.
-
-ArUco corners are stored on disk in the backend/input frame; the viewer automatically applies `sim3_to_output_frame.npy` so the markers line up with the aligned point cloud.
 
 ### Python API
 

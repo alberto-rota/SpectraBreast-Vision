@@ -134,6 +134,7 @@ starlette==0.52.1
 sympy==1.14.0
 tensorboard==2.20.0
 tensorboard-data-server==0.7.2
+textual==8.2.4
 threadpoolctl==3.6.0
 tomlkit==0.13.3
 torch==2.10.0+cu130

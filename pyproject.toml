@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spectra"
+version = "0.1.0"
+description = "ArUco-stabilized 3D reconstruction pipeline (VGGT | MASt3R) with a unified CLI, TUI, and Python API."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "SpectraBreast" }]
+# Heavy runtime dependencies (torch+CUDA, opencv, rerun-sdk, textual, typer,
+# pydantic, the VGGT/MASt3R clones, asmk, ...) are pinned in requirements.txt
+# and installed via `uv pip install -r requirements.txt`. We intentionally
+# leave this list empty so that `uv sync` / `uv run` do NOT try to re-resolve
+# CUDA wheels or the editable `mast3r/asmk` submodule.
+dependencies = []
+
+[project.scripts]
+spectra = "spectra.cli:main"
+
+[tool.setuptools]
+# Only ship the `spectra/` package; skip the top-level legacy scripts and the
+# third-party `vggt/` and `mast3r/` clones that live side-by-side in this repo.
+packages = ["spectra", "spectra.backends"]

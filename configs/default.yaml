@@ -1,0 +1,71 @@
+# Default configuration for the ArUco-stabilized 3D reconstruction pipeline.
+# Load with `spectra.config.load_config(...)` or pass to the CLI with
+# `python -m spectra reconstruct --config configs/default.yaml`.
+
+input:
+  rgb_dir: DATA/SAMPLE1_iphone/rgb
+  # Optional directories; leave null for RGB-only mode:
+  pose_dir: null
+  camera_params_dir: null
+
+output:
+  root: RESULTS
+  run_name: SCENE1                # null -> timestamp-named subfolder
+  update_most_recent_symlink: true
+
+backend: vggt                   # vggt | mast3r
+
+aruco:
+  dictionary: 4x4_50
+  marker_edge_length_m: 0.09   # physical edge length of one marker (meters)
+  origin_marker_id: null        # null -> centroid of all triangulated corners
+  min_views_per_marker: 2
+  align_to_aruco: false
+  max_sim3_scale_deviation_when_poses_known: 0.05
+  detection_draw_scale: 2.0
+
+surface:
+  grid_step: 0.0                # <= 0 -> auto-estimate
+  fill_iters: 2
+  smooth_iters: 1
+  min_neighbors: 3
+  max_resolution: 2048
+  conf_threshold_percentile: 50.0
+
+vggt:
+  model_name: facebook/VGGT-1B
+  image_size: 1024
+  conf_thres: 50.0
+  cloud_source: depth_map       # depth_map | point_map
+  camera_source: predicted      # predicted | gt  (gt requires pose_dir)
+  alignment_mode: sim3          # sim3 | se3 (only used when camera_source == gt)
+  mask_black_bg: false
+  mask_white_bg: true
+
+mast3r:
+  model_name: naver/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric
+  image_size: 512
+  neighbor_window: 2
+  desc_conf_thr: 0.1
+  dense_conf_thr: 12.0
+  voxel_size: 0.0015
+  max_points: 2000000
+  pixel_tol: 1.5
+  max_matches_per_pair: 50000
+  pose_refine_iters: 1
+  pose_refine_lr: 0.0
+  pose_refine_lr_min: 0.00001
+  pose_prior_sigma_deg: 1.0
+  pose_prior_sigma_m: 0.01
+  pose_prior_weight: 0.06
+  pose_refine_log_every: 25
+  pose_refine_max_drot_deg: 8.0
+  pose_refine_max_dt_m: 0.06
+  dense_refine_iters: 1
+  dense_refine_lr: 0.0
+  confidence_percentile: 99.0
+
+rerun:
+  enabled: true
+  grpc_port: 9876
+  no_wait: false
