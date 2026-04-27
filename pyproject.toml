@@ -5,16 +5,38 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "spectra"
 version = "0.1.0"
-description = "ArUco-stabilized 3D reconstruction pipeline (VGGT | MASt3R) with a unified CLI, TUI, and Python API."
+description = "MASt3R-SfM + ArUco 3D reconstruction: images to metric point cloud with 2D/3D marker outputs."
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "SpectraBreast" }]
-# Heavy runtime dependencies (torch+CUDA, opencv, rerun-sdk, textual, typer,
-# pydantic, the VGGT/MASt3R clones, asmk, ...) are pinned in requirements.txt
-# and installed via `uv pip install -r requirements.txt`. We intentionally
-# leave this list empty so that `uv sync` / `uv run` do NOT try to re-resolve
-# CUDA wheels or the editable `mast3r/asmk` submodule.
-dependencies = []
+dependencies = [
+    "asmk",
+    "cython>=3.0",
+    "einops>=0.8",
+    "faiss-gpu-cu12>=1.14.1.post1",
+    "gradio>=6.0",
+    "huggingface-hub>=0.20",
+    "jaxtyping>=0.3",
+    "jupyter>=1.1.1",
+    "numpy>=1.26",
+    "open3d>=0.19",
+    "opencv-python>=4.8",
+    "pillow>=10.0",
+    "pyaml>=25.0",
+    "pydantic>=2.8",
+    "pyyaml>=6.0",
+    "rerun-sdk>=0.30",
+    "rich>=13.0",
+    "roma>=1.5",
+    "safetensors>=0.4",
+    "scipy>=1.11",
+    "textual>=0.60",
+    "torch>=2.2",
+    "torchvision>=0.17",
+    "tqdm>=4.66",
+    "trimesh>=4.0",
+    "typer>=0.12",
+]
 
 [project.scripts]
 spectra = "spectra.cli:main"
@@ -23,3 +45,6 @@ spectra = "spectra.cli:main"
 # Only ship the `spectra/` package; skip the top-level legacy scripts and the
 # third-party `vggt/` and `mast3r/` clones that live side-by-side in this repo.
 packages = ["spectra", "spectra.backends"]
+
+[tool.uv.sources]
+asmk = { path = "mast3r/asmk", editable = true }

@@ -6,6 +6,7 @@ backend-agnostic.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
 import numpy as np
@@ -28,7 +29,13 @@ def _require_rerun() -> None:
         raise RuntimeError("rerun is not installed; cannot log visuals.")
 
 
-def init_rerun(app_name: str, grpc_port: int) -> None:
+def init_rerun(
+    app_name: str,
+    grpc_port: int,
+    *,
+    rrd_path: str | Path | None = None,
+) -> None:
+    """Initialize Rerun; optionally also stream the recording to ``*.rrd`` (multi-sink when supported)."""
     if not HAS_RERUN:
         return
     try:
@@ -36,30 +43,138 @@ def init_rerun(app_name: str, grpc_port: int) -> None:
     except Exception:
         pass
     rr.init(app_name)
-    rr.serve_grpc(grpc_port=grpc_port)
+    port = int(grpc_port)
+    rrd = Path(rrd_path) if rrd_path is not None else None
+    if rrd is not None:
+        rrd.parent.mkdir(parents=True, exist_ok=True)
+        p = str(rrd)
+        gurl = f"rerun+http://127.0.0.1:{port}/proxy"
+        set_sinks = getattr(rr, "set_sinks", None)
+        if callable(set_sinks) and hasattr(rr, "FileSink") and hasattr(rr, "GrpcSink"):
+            last_exc: Exception | None = None
+            for factory in (
+                (lambda: (rr.GrpcSink(url=gurl), rr.FileSink(p))),
+                (lambda: (rr.GrpcSink(), rr.FileSink(p))),
+            ):
+                try:
+                    g, f = factory()
+                    set_sinks(g, f)
+                    return
+                except Exception as exc:  # pragma: no cover - version-matrix
+                    last_exc = exc
+            from rich import print as rprint  # type: ignore[import-not-found]
+
+            rprint(
+                f"[yellow]Rerun: could not open .rrd FileSink ({last_exc!r}); gRPC only (no {p}).[/yellow]"
+            )
+        else:
+            from rich import print as rprint  # type: ignore[import-not-found]
+
+            rprint(
+                f"[yellow]Rerun: set_sinks / FileSink / GrpcSink missing; gRPC only (no {p}).[/yellow]"
+            )
+    rr.serve_grpc(grpc_port=port)
 
 
-def send_blueprint() -> None:
+def _save_blueprint_file(
+    blueprint: "rrb.Blueprint", application_id: str, rbl_path: str | Path
+) -> None:
+    """Write layout to ``*.rbl``; ``application_id`` must match :func:`init_rerun` app name."""
     if not HAS_RERUN:
         return
-    blueprint = rrb.Blueprint(
-        rrb.Vertical(
-            rrb.Horizontal(
+    p = Path(rbl_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    save = getattr(blueprint, "save", None)
+    if not callable(save):
+        return
+    try:
+        save(application_id, str(p))  # type: ignore[call-arg]
+    except TypeError:  # pragma: no cover - API drift
+        try:
+            save(str(p), application_id=application_id)  # type: ignore[call-arg]
+        except (TypeError, OSError) as e:
+            from rich import print as rprint  # type: ignore[import-not-found]
+
+            rprint(f"[yellow]Rerun: could not save .rbl ({e}).[/yellow]")
+
+
+def _spatial3d_view_content_query(path: str) -> str:
+    """Build a Rerun 0.2+ :class:`Spatial3DView` *contents* query (see ViewContents).
+
+    Plain path strings like ``"/aruco"`` match at most that *single* entity. ArUco
+    data is logged on **children** (e.g. ``/aruco/0/face``, ``/aruco/plane``), so
+    the Scene view would show no markers. Hierarchical roots need a subtree
+    include such as ``"+ /aruco/**"`` (same for ``/cameras`` and ``/surface``).
+    """
+    p = path if path.startswith("/") else f"/{path}"
+    if p in ("/aruco", "/cameras", "/surface"):
+        return f"+ {p}/**"
+    return f"+ {p}"
+
+
+def send_blueprint(
+    *,
+    include_scene_view: bool = True,
+    include_confidence_view: bool = True,
+    include_camera_images_view: bool = True,
+    include_cameras: bool = True,
+    include_cloud: bool = True,
+    include_cloud_confidence: bool = True,
+    include_aruco: bool = True,
+    include_surface: bool = True,
+    application_id: str | None = None,
+    rbl_path: str | Path | None = None,
+) -> None:
+    if not HAS_RERUN:
+        return
+    top_row_views = []
+    if include_scene_view:
+        scene_contents = []
+        if include_cloud:
+            scene_contents.append(_spatial3d_view_content_query("/points"))
+        if include_cameras:
+            scene_contents.append(_spatial3d_view_content_query("/cameras"))
+        if include_aruco:
+            scene_contents.append(_spatial3d_view_content_query("/aruco"))
+        if include_surface:
+            scene_contents.append(_spatial3d_view_content_query("/surface"))
+        if scene_contents:
+            top_row_views.append(
                 rrb.Spatial3DView(
                     name="Scene",
                     origin="/",
-                    contents=["/points", "/cameras", "/aruco", "/surface"],
-                ),
-                rrb.Spatial3DView(
-                    name="Confidence",
-                    origin="/",
-                    contents=["/points_confidence"],
-                ),
-            ),
-            rrb.Spatial2DView(name="Camera images", origin="/cameras"),
-        ),
-    )
+                    contents=scene_contents,
+                )
+            )
+
+    if include_confidence_view and include_cloud_confidence:
+        top_row_views.append(
+            rrb.Spatial3DView(
+                name="Confidence",
+                origin="/",
+                contents=[_spatial3d_view_content_query("/points_confidence")],
+            )
+        )
+
+    layout_children = []
+    if top_row_views:
+        if len(top_row_views) == 1:
+            layout_children.append(top_row_views[0])
+        else:
+            layout_children.append(rrb.Horizontal(*top_row_views))
+
+    if include_camera_images_view and include_cameras:
+        layout_children.append(rrb.Spatial2DView(name="Camera images", origin="/cameras"))
+
+    if not layout_children:
+        return
+    if len(layout_children) == 1:
+        blueprint = rrb.Blueprint(layout_children[0])
+    else:
+        blueprint = rrb.Blueprint(rrb.Vertical(*layout_children))
     rr.send_blueprint(blueprint, make_active=True)
+    if rbl_path is not None and application_id is not None:
+        _save_blueprint_file(blueprint, application_id, rbl_path)
 
 
 def rerun_flush() -> None:
@@ -98,14 +213,16 @@ def log_camera(
         f"/cameras/{index}",
         rr.Transform3D(translation=T_world_cam[:3, 3], mat3x3=T_world_cam[:3, :3]),
     )
-    rr.log(
-        f"/cameras/{index}/image",
-        rr.Pinhole(
-            image_from_camera=np.asarray(K, dtype=np.float32),
-            resolution=list(resolution_wh),
-            image_plane_distance=image_plane_distance,
-        ),
-    )
+    pinhole_kwargs: dict = {
+        "image_from_camera": np.asarray(K, dtype=np.float32),
+        "resolution": list(resolution_wh),
+        "image_plane_distance": image_plane_distance,
+    }
+    # Match OpenCV / VGGT (X right, Y down, Z forward) so frustums line up with ``/points`` + ``/aruco``.
+    vc = getattr(rr, "ViewCoordinates", None)
+    if vc is not None and hasattr(vc, "RDF"):
+        pinhole_kwargs["camera_xyz"] = vc.RDF
+    rr.log(f"/cameras/{index}/image", rr.Pinhole(**pinhole_kwargs))
     if image_rgb is not None:
         rr.log(f"/cameras/{index}/image/rgb", rr.Image(image_rgb))
     if image_aruco_rgb is not None:
@@ -114,12 +231,35 @@ def log_camera(
         rr.log(f"/cameras/{index}/image/confidence", rr.Image(confidence_rgb))
 
 
-def log_cloud(points: np.ndarray, colors: np.ndarray, conf_colors: np.ndarray | None = None) -> None:
+def log_cloud(
+    points: np.ndarray,
+    colors: np.ndarray,
+    conf_colors: np.ndarray | None = None,
+    *,
+    log_rgb: bool = True,
+    log_confidence: bool = True,
+) -> None:
     if not HAS_RERUN:
         return
-    rr.log("/points", rr.Points3D(points, colors=colors), static=True)
-    if conf_colors is not None:
+    if log_rgb:
+        rr.log("/points", rr.Points3D(points, colors=colors), static=True)
+    if log_confidence and conf_colors is not None:
         rr.log("/points_confidence", rr.Points3D(points, colors=conf_colors), static=True)
+
+
+def resample_cloud_for_logging(
+    points: np.ndarray,
+    colors: np.ndarray,
+    confidence: np.ndarray,
+    factor: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Subsample cloud consistently across points/colors/confidence."""
+    factor = float(factor)
+    if factor >= 1.0 or points.shape[0] <= 1:
+        return points, colors, confidence
+    keep_count = max(1, int(round(points.shape[0] * factor)))
+    keep_idx = np.linspace(0, points.shape[0] - 1, num=keep_count, dtype=np.int64)
+    return points[keep_idx], colors[keep_idx], confidence[keep_idx]
 
 
 def _log_marker_highlight_3d(
@@ -289,6 +429,7 @@ __all__ = [
     "log_cloud",
     "log_surface_mesh",
     "log_xy_plane",
+    "resample_cloud_for_logging",
     "rerun_flush",
     "send_blueprint",
 ]

@@ -53,8 +53,7 @@ input:
 output:
   root: RESULTS
   run_name: null
-
-backend: vggt
+  z_axis_points_down: true
 
 aruco:
   dictionary: 4x4_50
@@ -71,18 +70,9 @@ surface:
   min_neighbors: 3
   max_resolution: 2048
 
-vggt:
-  model_name: facebook/VGGT-1B
-  image_size: 518
-  conf_thres: 50.0
-  cloud_source: depth_map
-  camera_source: predicted
-  alignment_mode: sim3
-  mask_black_bg: false
-  mask_white_bg: false
-
 mast3r:
   model_name: naver/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric
+  pipeline_variant: sfm
   image_size: 512
   neighbor_window: 2
   desc_conf_thr: 0.1
@@ -263,8 +253,10 @@ class ReconstructionTUI(App[None]):
     def action_validate(self) -> None:
         cfg = self._parse_config()
         if cfg is not None:
-            self.status_text = f"Config OK (backend={cfg.backend})."
-            self._log(f"[green]Config OK:[/green] backend={cfg.backend}, rgb_dir={cfg.input.rgb_dir}")
+            self.status_text = "Config OK (MASt3R-SfM)."
+            self._log(
+                f"[green]Config OK:[/green] MASt3R-SfM, rgb_dir={cfg.input.rgb_dir}"
+            )
 
     def action_run(self) -> None:
         if self._worker_thread is not None and self._worker_thread.is_alive():
@@ -273,8 +265,8 @@ class ReconstructionTUI(App[None]):
         cfg = self._parse_config()
         if cfg is None:
             return
-        self.status_text = f"Running {cfg.backend} reconstruction on {cfg.input.rgb_dir}..."
-        self._log(f"[bold cyan]Starting run:[/bold cyan] backend={cfg.backend}")
+        self.status_text = f"Running MASt3R-SfM on {cfg.input.rgb_dir}..."
+        self._log("[bold cyan]Starting run:[/bold cyan] MASt3R-SfM")
         self._worker_thread = threading.Thread(
             target=self._run_worker, args=(cfg,), daemon=True
         )

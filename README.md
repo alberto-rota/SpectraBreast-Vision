@@ -1,558 +1,83 @@
-# SpectraBreast Sample 3D Reconstruction 
+# SpectraBreast — Vision Pipeline 
+Contributors: **Alberto Rota**, **Leonardo Passoni**, **Anna Bicchi**
 
-### Repository Structure
-- `rgb_images/`: contains RGB data from camera, indexes `0000` to `0020`
-- `camera_poses/`: contains camera poses in robot space, as `.txt` files. Each file has one line with 6 floats, in the order: `[X Y Z Roll Pitch Yaw]`
-- `checkerboard`: contains RGB images with a checkerboard pattern, used for calibration
-- `camera_parameters`: contains `.npy` files with the intrinsic paramters (`[3x3]`), the camera-to-endeffector matrix  (`[4x4]`) and the  distortion parameters  (`[1x5]`)
-- `reconstruction`: 3D reconstruction outputs
-- `depth-anything-3`, `vggt`, `mast3r`, `nerf_data`: 3D reconstruction methods code cloned by each method repo
----
-- `helpers.py`: Helper functions, angle conversion, geometry, etc...
-- `intrinsic_calibration.py`: Camera calibration code. Loads the images from the `checkerboard` folder, searches for the checkerboard pattern and saves the calibration matrix and the distortion coefficients in `camera_parameters/` as `.npy` files
-- `vggt_pipeline.py`, `mast3r_pipeline.py`, `gsplat_pipeline.py`: 3D Reconstruction pipelines, one for each of the methods tested
-- `spectra/`: unified, ArUco-stabilized reconstruction package (CLI + TUI + API) wrapping both VGGT and MASt3R back-ends
----
+## Installation
+Use with [uv](https://docs.astral.sh/uv/) as your environemnt manager. See https://docs.astral.sh/uv/#installation for installation guidelines.
 
-## Unified ArUco-stabilized pipeline (`spectra`)
-
-The `spectra` package bundles ArUco detection, 3D reconstruction (VGGT or MASt3R), ArUco-based Sim3 alignment (Z-up XY plane, metric scale from the known marker edge length), and height-field surface reconstruction behind a single entry point.
-
-Three equivalent ways to drive it:
-
-- **CLI**: `spectra <subcommand>` (Typer; auto-completion + `--help`)
-- **TUI**: `spectra tui` (Textual; sample browser + YAML editor + live log)
-- **API**: `from spectra import run_reconstruction, load_config, ReconstructionConfig`
-
-### Installation (with [`uv`](https://docs.astral.sh/uv/))
+Clone-to-run:
 
 ```bash
-# Clone the repo
-git clone <this-repo> spectra && cd spectra
+git clone https://github.com/alberto-rota/SpectraBreast-Vision
+cd SpectraBreast-Vision
+uv sync
+uv run spectra --help
+```
 
-# Create the project venv (uv reads `requires-python` from pyproject.toml)
-uv venv
+This project is now fully managed by `uv`:
 
-# Seed the environment with all pinned, CUDA-built dependencies
-uv pip install -r requirements.txt
+- Dependencies are declared in `pyproject.toml` (including local editable `mast3r/asmk` via `tool.uv.sources`).
+- The CLI entrypoint is declared in `project.scripts`.
+- You can run commands without manual activation via `uv run ...`.
 
-# Register the `spectra` console script (no re-resolve of the pinned deps)
-uv pip install -e . --no-deps
+If you prefer activating a shell (won't require `uv run` before every command):
 
-# Activate the env so that `spectra ...` works directly
+```bash
 source .venv/bin/activate
-
-# Sanity-check the CLI
 spectra --help
 ```
 
-If you'd rather not activate the env, every recipe below also works as
-`uv run spectra <subcommand> ...` (uv injects the project venv for you).
+## CLI commands
 
-> **Why `uv pip` and not `uv sync`?** The heavy CUDA-pinned dependencies
-> (`torch==2.10.0+cu130`, `faiss-gpu-cu12`, the editable `mast3r/asmk`
-> submodule, ...) are tracked in `requirements.txt`, not in `pyproject.toml`.
-> `uv sync` would try to resolve an empty dependency set and wipe them.
-> `uv pip install -r requirements.txt` + `uv pip install -e . --no-deps`
-> gives you the same speed gains without touching the pinned set.
-
-> **Plain pip works too.** If you don't have `uv`, replace each `uv pip ...`
-> with `pip ...` and skip the `uv venv` step in favour of
-> `python3 -m venv .venv && source .venv/bin/activate`. Without an activated
-> env, use `python -m spectra ...` in place of `spectra ...`.
-
-### Expected input layout
-
-The only strict requirement is a folder of RGB images. Poses and intrinsics are optional:
-
-```text
-DATA/SAMPLE1_iphone/
-├── rgb/                         # required: *.png or *.jpg, sample on white bg + ArUcos
-│   ├── image_0000.png
-│   └── ...
-├── poses/                       # optional: one pose_NNNN.txt per image
-│   └── pose_0000.txt            #   (single line: X Y Z Roll Pitch Yaw)
-└── camera_parameters/           # optional
-    ├── intrinsics.npy           #   (3, 3) float intrinsics K
-    └── camera2ee.npy            #   (4, 4) float camera->end-effector (unused by spectra)
-```
-
-When `poses/` or `camera_parameters/intrinsics.npy` is missing, the back-end's own
-predicted cameras + intrinsics are used, and ArUco markers provide the metric
-scale via their known edge length.
-
-### CLI — `spectra reconstruct`
-
-Copy-pastable recipes (adjust `DATA/SAMPLE1_iphone` to your sample folder):
+- `spectra recon` - Run the 3D reconstruction pipeline 
+- `spectra detect` - 2D ArUco detection
+- `spectra viewer` - Gradio browser to inspect outputs under `RESULTS/`
+- `spectra calibrate-intrinsics` - checkerboard-based camera intrinsic calibration
 
 ```bash
-# 1) Minimal run driven by the shipped default config
-spectra reconstruct --config configs/default.yaml
+# Config-driven
+uv run spectra recon --config configs/default.yaml
 
-# 2) Same config but override input + output folders on the command line
-spectra reconstruct \
-    --config configs/default.yaml \
-    --rgb-dir DATA/SAMPLE1_iphone/rgb \
-    --pose-dir DATA/SAMPLE1_iphone/poses \
-    --camera-params-dir DATA/SAMPLE1_iphone/camera_parameters \
-    --out-dir RESULTS \
-    --run-name sample1_vggt_aruco
+# Overrides
+uv run spectra recon -c configs/default.yaml --rgb-dir DATA/s/rgb --out RESULTS --run-name trial1
 
-# 3) Pure RGB-only run (no poses, no intrinsics) with MASt3R + a custom marker size
-spectra reconstruct \
-    --config configs/default.yaml \
-    --rgb-dir DATA/SAMPLE1_iphone/rgb \
-    --backend mast3r \
-    --marker-edge-length-m 0.030 \
-    --no-wait
+# [WORK IN PROGRESS] Optional camera pose and intrinsic GT: same stem order as images → pose_*.txt + intrinsics.npy folder
+uv run spectra recon -c configs/default.yaml \
+  --rgb-dir DATA/s/rgb --pose-dir DATA/s/poses --camera-params-dir DATA/s/cam
 
-# 4) Override any config field with `--set KEY=VALUE` (dotted paths, JSON values)
-spectra reconstruct \
-    --config configs/default.yaml \
-    --set backend=vggt \
-    --set aruco.marker_edge_length_m=0.025 \
-    --set aruco.origin_marker_id=0 \
-    --set surface.grid_step=0.001 \
-    --set vggt.cloud_source=point_map \
-    --set vggt.conf_thres=80.0 \
-    --set rerun.no_wait=true
+# 2D detection only
+uv run spectra detect DATA/s/rgb /tmp/aruco_out
 
-# 5) Disable ArUco alignment entirely (keep the back-end's native frame)
-spectra reconstruct \
-    --config configs/default.yaml \
-    --no-align-to-aruco
+# Intrinsic calibration from checkerboard images
+uv run spectra calibrate-intrinsics --image-dir checkerboard --output-dir intrinsics
 
-# 6) Skip the YAML entirely: pass the RGB folder and rely on defaults
-spectra reconstruct --rgb-dir DATA/SAMPLE1_iphone/rgb --no-wait
-
-# 7) Different Rerun gRPC port (useful when running several jobs in parallel)
-spectra reconstruct --config configs/default.yaml --grpc-port 9877 --no-wait
-```
-
-All `reconstruct` flags:
-
-| Flag | Description |
-|------|-------------|
-| `--config, -c PATH` | YAML config file (see `configs/default.yaml`). Optional if `--rgb-dir` is given. |
-| `--rgb-dir PATH` | Folder with input images. Overrides `input.rgb_dir`. |
-| `--pose-dir PATH` | Folder with `pose_*.txt`. Overrides `input.pose_dir`. |
-| `--camera-params-dir PATH` | Folder with `intrinsics.npy`. Overrides `input.camera_params_dir`. |
-| `--out-dir PATH` | Root folder for run outputs. Overrides `output.root`. |
-| `--run-name NAME` | Subfolder name inside `--out-dir` (default: timestamp). |
-| `--backend {vggt, mast3r}` | Back-end to use. Overrides `backend`. |
-| `--marker-edge-length-m FLOAT` | Physical ArUco edge length in meters. |
-| `--aruco-dictionary NAME` | OpenCV dictionary (e.g. `4x4_50`, `5x5_100`, `apriltag_36h11`). |
-| `--align-to-aruco / --no-align-to-aruco` | Enable/disable ArUco-based Sim3 alignment. |
-| `--origin-marker-id INT` | Marker ID that defines the output-frame origin. |
-| `--grpc-port INT` | Rerun gRPC server port (default `9876`). |
-| `--no-wait` | Do not block on `input()` after logging to Rerun. |
-| `--set, -s KEY=VALUE` | Override any config field via dotted path (repeatable). Values are parsed as JSON when possible (so `true`, `false`, numbers, and strings all work). |
-
-### CLI — `spectra detect-aruco`
-
-Drop-in replacement for the legacy `detect_aruco.py` script:
-
-```bash
-# Detect markers, dump per-image JSON + color-coded annotated PNGs
-spectra detect-aruco DATA/SAMPLE1_iphone/rgb RESULTS/aruco_only
-
-# Different dictionary and bigger annotation strokes
-spectra detect-aruco DATA/SAMPLE1_iphone/rgb RESULTS/aruco_only \
-    --dict 5x5_100 --draw-scale 2.5
-```
-
-Outputs:
-
-```text
-RESULTS/aruco_only/
-├── json/          # per-image {id, corners_xy, center_xy} JSON
-└── annotated/     # color-coded preview PNGs (one color per marker ID)
-```
-
-### CLI — `spectra tui`
-
-```bash
-# Launch the Textual TUI (uses DATA/ as the sample browser root)
-spectra tui
-
-# Pre-load a config into the YAML editor and point at a different data root
-spectra tui --config configs/default.yaml --data-root /path/to/samples
-```
-
-The TUI has three panes:
-
-- **Left** — directory tree of the data root. Click any folder that contains an `rgb/` subfolder to auto-fill `input.rgb_dir` (plus `poses/` and `camera_parameters/` when they exist) in the YAML editor.
-- **Center** — YAML editor with `Validate` (Ctrl+V) and `Run` (Ctrl+R) buttons.
-- **Right** — live stdout/stderr of the running pipeline + status bar.
-
-The pipeline runs in a background thread, so the UI stays responsive while VGGT or MASt3R crunches.
-
-### CLI — `spectra viewer` (local 3D viewer)
-
-A minimal Gradio app that lets you inspect any finished run in the browser. It streams a single GLB containing the fused RGB point cloud + all triangulated ArUco markers (per-ID colored quads), optionally overlaid on the surface mesh.
-
-```bash
-# Browse ./RESULTS on http://127.0.0.1:7860 and pick a run from the dropdown
-spectra viewer
-
-# Custom results folder / port, no auto-open browser
-spectra viewer --results-dir RESULTS --port 7861 --no-browser
-
-# Expose a temporary public Gradio share link (off by default)
-spectra viewer --share
-```
-
-Controls inside the app:
-
-- **Run** dropdown — lists every subfolder of `--results-dir` containing a `cloud.npz` (newest first). `Refresh list` rescans the folder.
-- **Max points** slider — uniformly subsamples the cloud before sending it to the browser. Keep ~150k for smooth interaction; bump up for visual fidelity.
-- **Overlay surface mesh** — also renders `surface_mesh.ply` if present.
-
-ArUco corners are stored on disk in the backend/input frame; the viewer automatically applies `sim3_to_output_frame.npy` so the markers line up with the aligned point cloud.
-
-### Python API
-
-#### Minimal end-to-end run
-
-```python
-from spectra import load_config, run_reconstruction
-
-cfg = load_config("configs/default.yaml")
-result = run_reconstruction(cfg)  # logs to stdout + Rerun, writes files under result.run_dir
-
-print("Run folder           :", result.run_dir)
-print("Cloud points         :", result.cloud_points.shape)   # (N, 3) float32
-print("Cloud colors         :", result.cloud_colors.shape)   # (N, 3) uint8
-print("Confidence           :", result.cloud_confidence.shape)
-print("Camera poses (W<-C)  :", result.T_world_cam.shape)    # (V, 4, 4)
-print("Intrinsics           :", result.K_per_view_orig.shape)# (V, 3, 3)
-print("Output frame         :", result.frame_description)    # 'aruco' | backend native
-```
-
-#### Build a config programmatically (no YAML)
-
-```python
-from pathlib import Path
-from spectra import (
-    ArucoConfig, InputConfig, Mast3rConfig, OutputConfig,
-    ReconstructionConfig, SurfaceConfig, VggtConfig, run_reconstruction,
-)
-from spectra.config import RerunConfig
-
-cfg = ReconstructionConfig(
-    input=InputConfig(
-        rgb_dir=Path("DATA/SAMPLE1_iphone/rgb"),
-        pose_dir=None,                  # RGB-only
-        camera_params_dir=None,
-    ),
-    output=OutputConfig(root=Path("RESULTS"), run_name="sample1_api"),
-    backend="vggt",
-    aruco=ArucoConfig(
-        dictionary="4x4_50",
-        marker_edge_length_m=0.025,
-        align_to_aruco=True,
-    ),
-    surface=SurfaceConfig(grid_step=0.0, fill_iters=2, smooth_iters=1),
-    vggt=VggtConfig(cloud_source="depth_map", conf_thres=50.0),
-    mast3r=Mast3rConfig(),
-    rerun=RerunConfig(no_wait=True),
-)
-
-result = run_reconstruction(cfg)
-```
-
-#### Apply dotted-path overrides to an existing config
-
-```python
-from spectra import load_config, run_reconstruction
-
-cfg = load_config("configs/default.yaml").with_overrides({
-    "backend": "mast3r",
-    "aruco.marker_edge_length_m": 0.030,
-    "aruco.origin_marker_id": 0,
-    "surface.grid_step": 0.001,
-    "mast3r.dense_conf_thr": 8.0,
-    "rerun.no_wait": True,
-})
-
-result = run_reconstruction(cfg)
-```
-
-#### Inspect the reconstructed surface
-
-```python
-import numpy as np
-from spectra import run_reconstruction, load_config
-
-result = run_reconstruction(load_config("configs/default.yaml"))
-surface = result.surface
-
-# Flat arrays (one row per occupied cell of the HxW grid)
-vertices   = surface.points       # (Ns, 3) float32, in the output frame
-colors     = surface.colors       # (Ns, 3) uint8
-normals    = surface.normals      # (Ns, 3) float32, unit length
-triangles  = surface.triangles    # (Nt, 3) int32 indices into vertices
-
-# Dense height field (useful when aligning with a top-down HSI camera)
-H, W       = surface.grid_shape
-height_map = surface.height_grid  # (H, W) float32, NaN on empty cells
-u_coords   = surface.u_coords     # (W,) float32, plane-X in meters
-v_coords   = surface.v_coords     # (H,) float32, plane-Y in meters
-observed   = surface.observed_mask # (H, W) bool
-
-print(f"Height field: {H}x{W} @ step={surface.grid_step:.4f} m")
-print(f"Observed cells: {observed.sum()} / {H * W}")
-print(f"Mean height (observed): {np.nanmean(height_map[observed]):.4f} m")
-```
-
-#### Inspect the ArUco alignment
-
-```python
-result = run_reconstruction(load_config("configs/default.yaml"))
-alignment = result.aruco_alignment  # spectra.align.ArucoAlignment | None
-
-if alignment is not None:
-    print("Markers used   :", alignment.used_marker_ids)
-    print("Metric scale   :", alignment.scale, "+/-", alignment.scale_mad)
-    print("Sim3 applied   :", alignment.sim3.shape)          # (4, 4), float32
-    print("Rotation       :", alignment.rotation.shape)      # (3, 3)
-    print("Translation    :", alignment.translation.shape)   # (3,)
-    for mid, marker in alignment.markers.items():
-        print(f"  id={mid}: corners={marker.corners_3d.shape}, "
-              f"edges={marker.edge_lengths_3d}, rmse_px={marker.reproj_rmse_px:.3f}")
-```
-
-#### Use ArUco detection standalone
-
-```python
-import cv2
-from spectra import ArucoDetector, detect_folder, annotate_image, color_for_id_rgb
-
-# Batch-detect on a folder + dump annotated PNGs and JSONs
-detections_by_stem = detect_folder(
-    rgb_dir="DATA/SAMPLE1_iphone/rgb",
-    out_dir="RESULTS/aruco_only",
-    dictionary="4x4_50",
-    draw_scale=2.0,
-)
-for stem, detections in detections_by_stem.items():
-    print(f"{stem}: {[d.id for d in detections]}")
-
-# Per-image API (reuse a single detector object for speed)
-detector = ArucoDetector(dictionary="4x4_50")
-image_bgr = cv2.imread("DATA/SAMPLE1_iphone/rgb/image_0000.png")
-detections = detector.detect(image_bgr)
-annotated_bgr = annotate_image(image_bgr, detections, draw_scale=2.0)
-
-# Stable per-ID RGB color (same one used in annotated images + Rerun)
-for det in detections:
-    r, g, b = color_for_id_rgb(det.id)
-    print(f"marker id={det.id}  color=({r},{g},{b})  center={det.center_xy}")
-```
-
-#### Call a back-end directly (advanced)
-
-Skip ArUco alignment and surface reconstruction, just get the fused cloud:
-
-```python
-import torch
-from spectra import load_config
-from spectra.inputs import build_backend_inputs
-from spectra.backends.vggt_backend import run_vggt   # or mast3r_backend.run_mast3r
-
-cfg = load_config("configs/default.yaml")
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-inputs = build_backend_inputs(
-    rgb_dir=cfg.input.rgb_dir,
-    pose_dir=cfg.input.pose_dir,
-    camera_params_dir=cfg.input.camera_params_dir,
-    device=device,
-)
-raw = run_vggt(cfg, inputs)  # -> spectra.backends.types.RawReconstruction
-print(raw.fused_points.shape, raw.fused_colors.shape, raw.T_world_cam.shape)
-```
-
-#### Save a resolved config back to disk
-
-Every run already writes `run.yaml` and `run.json` next to the outputs, but you
-can also snapshot a config from Python:
-
-```python
-from spectra import load_config
-from spectra.config import save_config
-
-cfg = load_config("configs/default.yaml").with_overrides({"backend": "mast3r"})
-save_config(cfg, "configs/mast3r_variant.yaml")
-```
-
-### Outputs (per run, under `<output.root>/<output.run_name or timestamp>/`)
-
-- `cloud.ply`, `cloud.npz` — fused point cloud + colors + per-point confidence, in the output frame
-- `surface.ply`, `surface_mesh.ply`, `surface.npz` — triangulated height-field surface (vertex colors + normals)
-- `aruco_detections/{json,annotated}/` — per-image 2D ArUco detections + color-coded annotations
-- `aruco_markers_3d.json` — triangulated 3D corners (per ID), per-marker edge-length residual, used marker IDs
-- `sim3_to_output_frame.npy` — (4, 4) similarity that maps the back-end's native frame to the output frame
-- `camera_poses_output_frame.npy` — (V, 4, 4) camera poses in the output frame
-- `intrinsics_original_frame.npy`, `intrinsics_network_frame.npy` — per-view (3, 3) intrinsics
-- `run.yaml`, `run.json` — resolved configuration for the run (for reproducibility)
-- `reconstruction_metadata.json` — back-end name, cloud/surface sizes, ArUco alignment summary
-
-### Key ArUco config knobs (`configs/default.yaml`)
-
-| Field | Default | Description |
-|-------|---------|-------------|
-| `aruco.dictionary` | `4x4_50` | OpenCV dictionary name. Must match the markers physically placed around the sample. |
-| `aruco.marker_edge_length_m` | `0.025` | Physical edge length of one marker (meters). Drives metric scale of the whole reconstruction. |
-| `aruco.origin_marker_id` | `null` | If set, this marker defines the output-frame origin and in-plane orientation. Otherwise the centroid of all triangulated corners + dominant PCA tangent is used. |
-| `aruco.min_views_per_marker` | `2` | Minimum views in which a marker must be detected to be triangulated. |
-| `aruco.align_to_aruco` | `true` | Master switch: when `true`, apply a Sim3 so the ArUco plane becomes `Z=0` (Z up) with metric scale. |
-| `aruco.max_sim3_scale_deviation_when_poses_known` | `0.05` | If GT poses are provided, refuse to rescale the cloud when the ArUco-derived scale deviates from `1.0` by more than this fraction (guards against bad triangulations). |
-| `aruco.detection_draw_scale` | `2.0` | Thickness / text-size multiplier for the annotated preview images. |
-
-Other config groups (`input`, `output`, `backend`, `surface`, `vggt`, `mast3r`, `rerun`) expose every knob of both back-ends plus surface and Rerun-logging parameters; see `configs/default.yaml` for the full schema.
-
-### Requirements
-
-Beyond the main dependencies (`torch`, `opencv-python`, `rerun-sdk`, ...) the unified pipeline adds: `textual` (TUI), `pydantic>=2.7` (config schema), `typer` (CLI), and `pyyaml`. All are pinned in [`requirements.txt`](requirements.txt).
-
----
-
-<details>
-<summary><strong>VGGT [BEST]</strong></summary>
-
-<br/>
-
-The script <code>vggt_pipeline.py</code> runs the <a href="https://github.com/facebookresearch/vggt">VGGT</a> (Visual Geometry Grounded Transformer) pipeline: feedforward depth/point-map prediction and optional alignment to GT camera poses. It logs the 3D scene (point cloud, GT and predicted cameras) and a frame-by-frame 2D view to <a href="https://rerun.io/">Rerun</a>.
-
-**Basic usage**
-```bash
-python vggt_pipeline.py
-```
-
-**Outputs** (in <code>--out_dir</code>, default <code>reconstruction_vggt/</code>):
-
-- <code>vggt_extracted_cloud.ply</code> — colored point cloud (ASCII PLY, with confidence)
-- <code>vggt_extracted_cloud.npz</code> — points, colors, confidence
-- <code>camera_poses_output_frame.npy</code> — camera poses in the output frame (GT frame if <code>--camera_source gt</code>, else predicted)
-- <code>camera_poses_reconstruction.npy</code> — reconstruction cameras (predicted or aligned)
-- <code>intrinsics_predicted.npy</code>, <code>intrinsics_gt_network_geometry.npy</code>
-- <code>vggt_extracted_cloud_params.json</code> — parameters used
-- <code>confidence_maps/</code> — per-frame confidence visualizations
-
-**CLI arguments**
-
-| Argument | Default | Description |
-|----------|---------|-------------|
-| <code>--rgb_dir</code> | <code>rgb_images/</code> | Directory of RGB images (<code>image_*.png</code>) |
-| <code>--pose_dir</code> | <code>camera_poses/</code> | Directory of camera pose files (<code>pose_*.txt</code>) |
-| <code>--camera_params_dir</code> | <code>camera_parameters</code> | Directory with <code>intrinsics.npy</code> and optional <code>camera2ee.npy</code> |
-| <code>--out_dir</code> | <code>reconstruction_vggt</code> | Output directory |
-| <code>--model_name</code> | <code>facebook/VGGT-1B</code> | Hugging Face model name |
-| <code>--image_size</code> | <code>518</code> | VGGT input size (crop mode) |
-| <code>--conf_thres</code> | <code>50.0</code> | Confidence percentile to filter out (e.g. 50 = drop bottom 50%) |
-| <code>--cloud_source</code> | <code>depth_map</code> | <code>depth_map</code> (unproject depth) or <code>point_map</code> (point head directly) |
-| <code>--camera_source</code> | <code>predicted</code> | <code>predicted</code> (VGGT frame) or <code>gt</code> (align to robot/world frame) |
-| <code>--alignment_mode</code> | <code>sim3</code> | When <code>--camera_source gt</code>: <code>sim3</code> or <code>se3</code> |
-| <code>--mask_black_bg</code> | off | Mask out black background pixels |
-| <code>--mask_white_bg</code> | off | Mask out white background pixels |
-| <code>--grpc_port</code> | <code>9876</code> | Rerun gRPC port |
-| <code>--no_wait</code> | off | Do not wait for user input after logging to Rerun |
-
-**RGB-only mode**
-
-Both the pose directory (<code>--pose_dir</code>) and the camera intrinsics file
-(<code>&lt;camera_params_dir&gt;/intrinsics.npy</code>) are optional. If either is
-missing, the script automatically falls back to VGGT's own predicted cameras
-and intrinsics. When no GT poses are available, <code>--camera_source gt</code>
-is silently downgraded to <code>predicted</code>.
-
-**Examples**
-```bash
-# Defaults (GT poses + intrinsics if present, predicted frame, depth-map unprojection)
-python vggt_pipeline.py
-
-# Align reconstruction to GT robot frame (Sim3) - needs poses + intrinsics
-python vggt_pipeline.py --camera_source gt
-
-# Use point-map branch, align to GT, stricter confidence filtering
-python vggt_pipeline.py --cloud_source point_map --camera_source gt --alignment_mode sim3 --conf_thres 90.0
-
-# RGB-only: pass a directory that only contains rgb_images/, no poses, no intrinsics
-python vggt_pipeline.py --rgb_dir my_rgb_only/rgb_images --pose_dir /non/existent --camera_params_dir /non/existent --out_dir reconstruction_vggt_rgb_only
-
-# RGB-only, keep point map branch, mask bright background, non-interactive
-python vggt_pipeline.py --rgb_dir my_rgb_only/rgb_images --pose_dir /non/existent --camera_params_dir /non/existent --cloud_source point_map --mask_white_bg --no_wait
+# Arbitrary YAML field
+uv run spectra recon -c configs/default.yaml -s mast3r.voxel_size=0.002
 ```
 
 
-</details>
+Notes:
 
-<details>
-<summary><strong>MASt3R</strong></summary>
+- `uv run spectra`, `uv run python -m spectra`, and `uv run python -m spectra.cli` expose the same command tree (`run`, `detect`, `viewer`, hidden aliases).
+- `spectra viewer` / `spectra tui` are the CLI wrappers around `spectra.viewer.run_viewer` and `spectra.tui.run_tui`.
+- `spectra calibrate-intrinsics` wraps `spectra.calibration.calibrate_intrinsics`.
+- `mast3r_pipeline.py` is backward compatibility only; prefer `spectra recon`.
 
-<br/>
+## Input layout
 
-The script <code>mast3r_pipeline.py</code> runs the <a href="https://github.com/naver/mast3r#mast3r-sfm">MASt3R-SfM</a> pipeline (sparse global alignment) and writes a fused point cloud plus a JSON of the parameters used.
-
-**Basic usage**
-```bash
-python mast3r_pipeline.py
+```
+DATA/myset/
+  rgb/              # required: *.jpg / *.png
+  poses/            # optional: pose_0000.txt … (one line: X Y Z R P Y)
+  camera_parameters/  # optional: intrinsics.npy (3×3), camera2ee.npy (ignored by fusion)
 ```
 
-**Outputs** (in <code>--out_dir</code>, default <code>reconstruction/</code>):
+Relative paths in YAML are resolved from the current working directory.
 
-- <code>mast3r_output.ply</code> — colored point cloud (ASCII PLY)
-- <code>mast3r_params.json</code> — parameters used for that run (for reproducibility)
-- <code>cache/</code> — MASt3R-SfM cache (pairs, matches, etc.)
+## Outputs (per run folder under `output.root` / `run_name` or timestamp)
 
-**CLI arguments**
-
-| Argument                | Default         | Description                                                                           |
-|-------------------------|-----------------|---------------------------------------------------------------------------------------|
-| <code>--rgb_dir</code>          | <code>rgb_images/</code>   | Directory of RGB images (<code>image_*.png</code>)                                     |
-| <code>--pose_dir</code>         | <code>camera_poses/</code> | Directory of camera pose files (<code>pose_*.txt</code>)                               |
-| <code>--out_dir</code>          | <code>reconstruction</code> | Output directory for PLY and params JSON                                               |
-| <code>--image_size</code>       | <code>512</code>           | Image size for MASt3R (longer side)                                                    |
-| <code>--scene_graph</code>      | <em>(auto)</em>            | <code>complete</code>, <code>swin-N</code>, <code>logwin-N</code>; empty = auto (complete if &lt;40 images else swin-5) |
-| <code>--subsample</code>        | <code>4</code>             | Dense grid step: <code>1</code>, <code>2</code>, <code>4</code>, or <code>8</code>. Smaller = finer/smoother (less 8×8 blockiness), larger = faster |
-| <code>--lr1</code>              | <code>0.07</code>          | Coarse alignment learning rate                                                         |
-| <code>--niter1</code>           | <code>300</code>           | Coarse alignment iterations                                                            |
-| <code>--lr2</code>              | <code>0.01</code>          | Fine refinement learning rate                                                          |
-| <code>--niter2</code>           | <code>300</code>           | Fine refinement iterations                                                             |
-| <code>--opt_depth</code>        | on                | Optimize depth in alignment (use <code>--no_opt_depth</code> to disable)               |
-| <code>--shared_intrinsics</code>| on                | Shared intrinsics across views (use <code>--no_shared_intrinsics</code> to disable)    |
-| <code>--matching_conf_thr</code>| <code>5.0</code>           | Matching confidence threshold before fallback                                          |
-| <code>--min_conf_thr</code>     | <code>1.5</code>           | Min confidence to keep a point in the output cloud                                     |
-| <code>--max_points</code>       | <code>2000000</code>       | Max points to keep (subsample if exceeded)                                             |
-| <code>--grpc_port</code>        | <code>9876</code>          | Rerun gRPC port                                                                        |
-| <code>--no_wait</code>          | off               | Do not wait for user input after logging to Rerun                                      |
-
-**RGB-only mode**
-
-Both the pose directory (<code>--pose_dir</code>) and the camera intrinsics
-file (<code>&lt;camera_params_dir&gt;/intrinsics.npy</code>) are optional. If
-either is missing, the script:
-
-1. Skips the epipolar pose refinement step (it needs GT poses as initialization and GT intrinsics to compute the essential matrix).
-2. Initializes the MASt3R global aligner with a minimum-spanning-tree (<code>init="mst"</code>) instead of <code>known_poses</code>.
-3. Lets the aligner estimate per-image focals and principal points.
-
-**Examples**
-```bash
-# Defaults: GT poses + GT intrinsics drive refinement and dense alignment
-python mast3r_pipeline.py
-
-# Stronger confidence filtering and a custom output dir
-python mast3r_pipeline.py --out_dir reconstruction_run2 --dense_conf_thr 6 --voxel_size 0.001
-
-# Wider temporal window for more pairs, non-interactive
-python mast3r_pipeline.py --neighbor_window 3 --no_wait
-
-# RGB-only: no pose_dir, no intrinsics file. MASt3R estimates both.
-python mast3r_pipeline.py --rgb_dir my_rgb_only/rgb_images --pose_dir /non/existent --camera_params_dir /non/existent --out_dir reconstruction_mast3r_rgb_only
-
-# RGB-only with more pairs per image and non-interactive
-python mast3r_pipeline.py --rgb_dir my_rgb_only/rgb_images --pose_dir /non/existent --camera_params_dir /non/existent --neighbor_window 4 --dense_conf_thr 6 --no_wait
-```
-</details>
+- `cloud.ply`, `cloud.npz` — fused RGB point cloud  
+- `aruco_detections/json/`, `annotated/` — 2D ArUco  
+- `aruco_markers_3d.json` — 3D marker corners in the output frame (when alignment succeeds)  
+- `reconstruction_metadata.json` — run summary  
+- `run.yaml` / `run.json` — resolved configuration  
+- `rerun/spectra.rrd` — optional Rerun recording (if enabled)

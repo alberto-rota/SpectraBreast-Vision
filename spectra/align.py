@@ -1,7 +1,7 @@
 """Multi-view triangulation of ArUco corners, plane fit, and Sim3 alignment.
 
 This module ties the 2D ArUco detections from ``spectra.aruco`` to the 3D
-reconstruction produced by any back-end (VGGT or MASt3R). The high-level
+reconstruction produced by the MASt3R back-end. The high-level
 pipeline is:
 
 1. `triangulate_markers(...)` — linear DLT triangulation per corner across
@@ -23,11 +23,14 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Sequence, TypedDict
 
 import numpy as np
 
 from .aruco import MarkerDetection
+
+if TYPE_CHECKING:
+    from .marker_ba import BundleAdjustmentResult
 
 
 @dataclass(frozen=True)
@@ -76,6 +79,12 @@ class ArucoAlignment:
     translation: np.ndarray               # shape: (3,), float32
     used_marker_ids: List[int] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
+    # Populated when `align_with_aruco(..., use_bundle_adjustment=True)`. When
+    # present, the pipeline should apply ``bundle_adjustment.delta_T_per_view``
+    # + ``bundle_adjustment.scale_m_per_backend`` to the back-end's per-view
+    # point maps before fusion so the whole reconstruction stays consistent
+    # with the stable ArUco corners.
+    bundle_adjustment: Any = None  # Optional[BundleAdjustmentResult] — stringified to avoid cycle
 
 
 def _invert_rigid_4x4(T: np.ndarray) -> np.ndarray:
@@ -459,6 +468,34 @@ def apply_similarity_to_intrinsics(
     return np.asarray(K_per_view, dtype=np.float32).copy()
 
 
+def _markers_from_ba(
+    ba: "BundleAdjustmentResult",
+    edge_length_m: float,
+) -> Dict[int, MarkerTriangulation]:
+    """Wrap rigid-square BA corners into ``MarkerTriangulation`` objects.
+
+    The corners come from the BA-optimized per-marker 6-DoF pose times the
+    metric square template, so every marker has exact ``edge_length_m``
+    edges by construction. ``reproj_rmse_px`` is the per-marker final BA
+    residual (pixels).
+    """
+    out: Dict[int, MarkerTriangulation] = {}
+    for mid, corners in ba.marker_corners_m.items():
+        edges = np.linalg.norm(
+            corners[[1, 2, 3, 0]] - corners[[0, 1, 2, 3]], axis=1
+        ).astype(np.float32)
+        center = corners.mean(axis=0).astype(np.float32)
+        out[int(mid)] = MarkerTriangulation(
+            marker_id=int(mid),
+            corners_3d=corners.astype(np.float32),
+            num_views=1,  # BA pools across views; exact per-marker view count is in ba diagnostics
+            reproj_rmse_px=float(ba.per_marker_reproj_rmse_px.get(int(mid), float("nan"))),
+            edge_lengths_3d=edges,
+            center_3d=center,
+        )
+    return out
+
+
 def align_with_aruco(
     detections_per_view: Sequence[Sequence[MarkerDetection]],
     K_per_view: np.ndarray,
@@ -467,48 +504,111 @@ def align_with_aruco(
     origin_marker_id: int | None = None,
     min_views_per_marker: int = 2,
     enforce_metric_scale: bool = True,
+    use_bundle_adjustment: bool = False,
+    ba_options: Mapping[str, Any] | None = None,
 ) -> ArucoAlignment:
-    """One-call convenience: triangulate + fit plane + build Sim3.
+    """One-call convenience: triangulate (or jointly BA) + fit plane + build Sim3.
 
-    Returns an `ArucoAlignment` summarizing all intermediate products. The
-    caller is responsible for deciding whether to apply the transform
-    (typically via `apply_similarity_to_points`).
+    When ``use_bundle_adjustment=True``, runs
+    :func:`spectra.marker_ba.joint_bundle_adjust` to jointly refine per-marker
+    6-DoF poses (rigid squares of known edge length) and per-view SE(3)
+    camera deltas by minimizing reprojection errors of all corner detections.
+    The resulting ``ArucoAlignment.markers`` then hold stable rigid-square
+    corners in METRIC world, and ``ArucoAlignment.bundle_adjustment`` exposes
+    the per-view delta + scale that the pipeline must propagate to the
+    back-end's fused cloud so the whole scene stays coherent.
 
-    If `enforce_metric_scale` is False, the returned Sim3 uses scale=1 and
+    When ``use_bundle_adjustment=False`` (default, backward compatible),
+    behaves exactly as before: DLT triangulation + median-edge scale.
+
+    If ``enforce_metric_scale`` is False, the returned Sim3 uses scale=1 and
     only rotates/translates — useful when the input frame is already metric
-    and you just want to pin Z to the marker plane.
+    (e.g. right after BA, which always produces metric output).
     """
     warnings: List[str] = []
-    markers = triangulate_markers(
-        detections_per_view=detections_per_view,
-        K_per_view=np.asarray(K_per_view, dtype=np.float64),
-        T_world_cam_per_view=np.asarray(T_world_cam_per_view, dtype=np.float64),
-        min_views_per_marker=min_views_per_marker,
-    )
+    ba_result: "BundleAdjustmentResult | None" = None
+    scale: float
+    mad: float
 
-    if not markers:
-        warnings.append("No ArUco markers could be triangulated; skipping alignment.")
-        return ArucoAlignment(
-            markers={},
-            plane_frame=None,
-            scale=1.0,
-            scale_mad=float("inf"),
-            sim3=np.eye(4, dtype=np.float32),
-            sim3_scale=1.0,
-            rotation=np.eye(3, dtype=np.float32),
-            translation=np.zeros(3, dtype=np.float32),
-            used_marker_ids=[],
-            warnings=warnings,
+    if use_bundle_adjustment:
+        # Local import to avoid a circular dependency at module load time.
+        from .marker_ba import joint_bundle_adjust
+
+        opts = dict(ba_options or {})
+        ba_result = joint_bundle_adjust(
+            detections_per_view=detections_per_view,
+            K_per_view=np.asarray(K_per_view, dtype=np.float32),
+            T_world_cam_backend=np.asarray(T_world_cam_per_view, dtype=np.float32),
+            edge_length_m=float(edge_length_m),
+            min_views_per_marker=min_views_per_marker,
+            **opts,
+        )
+        warnings.extend(ba_result.warnings)
+
+        if not ba_result.marker_corners_m:
+            return ArucoAlignment(
+                markers={},
+                plane_frame=None,
+                scale=1.0,
+                scale_mad=float("inf"),
+                sim3=np.eye(4, dtype=np.float32),
+                sim3_scale=1.0,
+                rotation=np.eye(3, dtype=np.float32),
+                translation=np.zeros(3, dtype=np.float32),
+                used_marker_ids=[],
+                warnings=warnings + ["Bundle adjustment produced no markers."],
+                bundle_adjustment=ba_result,
+            )
+
+        markers = _markers_from_ba(ba_result, edge_length_m=edge_length_m)
+
+        # BA runs in meters already; the Sim3 to ArUco frame is a pure SE(3).
+        # ``scale`` still exposed for API symmetry (input -> meters = scale * x_input);
+        # here ``x_input`` is the caller's (backend-scaled-to-meters) frame, i.e. scale=1.
+        scale = 1.0
+        edges_all = np.concatenate([m.edge_lengths_3d for m in markers.values()], axis=0)
+        edges_all = edges_all[np.isfinite(edges_all) & (edges_all > 0)]
+        if edges_all.size > 0:
+            # Residual edge dispersion (should be numerically zero for rigid squares).
+            med = float(np.median(edges_all))
+            mad = float(np.median(np.abs(edges_all - med)))
+        else:
+            mad = float("inf")
+
+        # After BA, enforce_metric_scale is already realized (frame is in meters):
+        effective_scale = 1.0
+    else:
+        markers = triangulate_markers(
+            detections_per_view=detections_per_view,
+            K_per_view=np.asarray(K_per_view, dtype=np.float64),
+            T_world_cam_per_view=np.asarray(T_world_cam_per_view, dtype=np.float64),
+            min_views_per_marker=min_views_per_marker,
         )
 
-    scale, mad = estimate_metric_scale(markers, edge_length_m=edge_length_m)
-    if not math.isfinite(scale) or scale <= 0:
-        warnings.append(f"Scale estimation failed ({scale}); falling back to scale=1.0.")
-        scale = 1.0
+        if not markers:
+            warnings.append("No ArUco markers could be triangulated; skipping alignment.")
+            return ArucoAlignment(
+                markers={},
+                plane_frame=None,
+                scale=1.0,
+                scale_mad=float("inf"),
+                sim3=np.eye(4, dtype=np.float32),
+                sim3_scale=1.0,
+                rotation=np.eye(3, dtype=np.float32),
+                translation=np.zeros(3, dtype=np.float32),
+                used_marker_ids=[],
+                warnings=warnings,
+            )
+
+        scale, mad = estimate_metric_scale(markers, edge_length_m=edge_length_m)
+        if not math.isfinite(scale) or scale <= 0:
+            warnings.append(f"Scale estimation failed ({scale}); falling back to scale=1.0.")
+            scale = 1.0
+
+        effective_scale = float(scale) if enforce_metric_scale else 1.0
 
     plane_frame = fit_marker_plane(markers, origin_marker_id=origin_marker_id)
 
-    effective_scale = float(scale) if enforce_metric_scale else 1.0
     s, R, t = build_sim3_to_aruco_frame(plane_frame, scale=effective_scale)
     sim3 = build_similarity_matrix(s, R, t)
 
@@ -523,6 +623,141 @@ def align_with_aruco(
         translation=t,
         used_marker_ids=sorted(markers.keys()),
         warnings=warnings,
+        bundle_adjustment=ba_result,
+    )
+
+
+class MarkerReprojectionStats(TypedDict):
+    """Diagnostics from :func:`marker_corner_reprojection_stats`."""
+
+    rmse_px: float
+    max_px: float
+    p95_px: float
+    num_observations: int
+
+
+def markers_best_fit_plane_rms_m(
+    marker_corners_world: Mapping[int, np.ndarray],
+) -> float:
+    """RMS distance (meters) of every corner to the best-fit plane.
+
+    Single-sheet layouts stay below a few millimetres; multi-planar boards
+    (different walls) register much larger values — not an algorithm bug.
+    """
+    if not marker_corners_world:
+        return float("nan")
+    all_c = np.concatenate(
+        [np.asarray(v, dtype=np.float64).reshape(4, 3) for v in marker_corners_world.values()],
+        axis=0,
+    )  # [N, 3]
+    if all_c.shape[0] < 3:
+        return float("nan")
+    c = all_c - all_c.mean(axis=0, keepdims=True)
+    _, _, vh = np.linalg.svd(c, full_matrices=False)
+    n = vh[-1]
+    n = n / max(float(np.linalg.norm(n)), 1e-12)
+    dist = np.abs(c @ n)
+    return float(np.sqrt(np.mean(dist * dist)))
+
+
+def per_view_marker_corner_rmse_px(
+    detections_per_view: Sequence[Sequence[MarkerDetection]],
+    marker_corners_world: Mapping[int, np.ndarray],
+    K_per_view: np.ndarray,
+    T_world_cam: np.ndarray,
+) -> np.ndarray:
+    """Per-view RMSE (pixels) over all marker corners; NaN if no markers in that view.
+
+    Shape ``[V]`` float32. Uses the same projection model as bundle adjustment /
+    :func:`marker_corner_reprojection_stats`.
+    """
+    V = len(detections_per_view)
+    if K_per_view.shape[0] != V or T_world_cam.shape[0] != V:
+        raise ValueError("K_per_view / T_world_cam must have one row per view.")
+
+    sum_sq = np.zeros(V, dtype=np.float64)
+    counts = np.zeros(V, dtype=np.int64)
+    T_cw = _invert_rigid_4x4(np.asarray(T_world_cam, dtype=np.float64))
+
+    for v, dets in enumerate(detections_per_view):
+        R = T_cw[v, :3, :3]
+        tvec = T_cw[v, :3, 3]
+        K = np.asarray(K_per_view[v], dtype=np.float64)
+        fx, fy, cx, cy = float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])
+        for d in dets:
+            mid = int(d.id)
+            if mid not in marker_corners_world:
+                continue
+            pw = np.asarray(marker_corners_world[mid], dtype=np.float64).reshape(4, 3)
+            pc = pw @ R.T + tvec
+            z = pc[:, 2]
+            if np.any(z <= 1e-8):
+                continue
+            u = fx * pc[:, 0] / z + cx
+            vpix = fy * pc[:, 1] / z + cy
+            uv = np.stack([u, vpix], axis=1)
+            gt = np.asarray(d.corners_xy, dtype=np.float64).reshape(4, 2)
+            err = np.linalg.norm(uv - gt, axis=1)
+            sum_sq[v] += float(np.sum(err * err))
+            counts[v] += 4
+
+    out = np.full(V, np.nan, dtype=np.float64)
+    m = counts > 0
+    out[m] = np.sqrt(sum_sq[m] / counts[m])
+    return out.astype(np.float32)
+
+
+def marker_corner_reprojection_stats(
+    detections_per_view: Sequence[Sequence[MarkerDetection]],
+    marker_corners_world: Mapping[int, np.ndarray],
+    K_per_view: np.ndarray,
+    T_world_cam: np.ndarray,
+) -> MarkerReprojectionStats:
+    """Mean / max pixel error projecting ``marker_corners_world`` with ``T,K``.
+
+    Use this **after** Sim3 so ``marker_corners_world`` matches ``cloud.ply`` and
+    ``camera_poses_output_frame.npy`` — the same frame Rerun uses for ``/aruco``.
+    """
+    V = len(detections_per_view)
+    if K_per_view.shape[0] != V or T_world_cam.shape[0] != V:
+        raise ValueError("K_per_view / T_world_cam must have one row per view.")
+
+    T_cw = _invert_rigid_4x4(np.asarray(T_world_cam, dtype=np.float64))  # [V, 4, 4]
+    errs: List[float] = []
+
+    for v, dets in enumerate(detections_per_view):
+        R = T_cw[v, :3, :3]
+        tvec = T_cw[v, :3, 3]
+        K = np.asarray(K_per_view[v], dtype=np.float64)
+        fx, fy, cx, cy = float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])
+        for d in dets:
+            mid = int(d.id)
+            if mid not in marker_corners_world:
+                continue
+            pw = np.asarray(marker_corners_world[mid], dtype=np.float64).reshape(4, 3)
+            pc = pw @ R.T + tvec
+            z = pc[:, 2]
+            if np.any(z <= 1e-8):
+                continue
+            u = fx * pc[:, 0] / z + cx
+            vpix = fy * pc[:, 1] / z + cy
+            uv = np.stack([u, vpix], axis=1)
+            gt = np.asarray(d.corners_xy, dtype=np.float64).reshape(4, 2)
+            errs.extend(np.linalg.norm(uv - gt, axis=1).tolist())
+
+    if not errs:
+        return MarkerReprojectionStats(
+            rmse_px=float("nan"),
+            max_px=float("nan"),
+            p95_px=float("nan"),
+            num_observations=0,
+        )
+    e = np.asarray(errs, dtype=np.float64)
+    return MarkerReprojectionStats(
+        rmse_px=float(np.sqrt(np.mean(e * e))),
+        max_px=float(np.max(e)),
+        p95_px=float(np.percentile(e, 95.0)),
+        num_observations=int(e.shape[0]),
     )
 
 
@@ -538,5 +773,9 @@ __all__ = [
     "build_sim3_to_aruco_frame",
     "estimate_metric_scale",
     "fit_marker_plane",
+    "marker_corner_reprojection_stats",
+    "markers_best_fit_plane_rms_m",
+    "per_view_marker_corner_rmse_px",
     "triangulate_markers",
+    "MarkerReprojectionStats",
 ]

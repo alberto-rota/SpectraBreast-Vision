@@ -11,8 +11,10 @@ Typical usage::
     cfg = load_config("configs/default.yaml")
     cfg = cfg.with_overrides({"aruco.marker_edge_length_m": 0.03})
 
-CLI overrides use dotted paths, e.g. ``--set aruco.marker_edge_length_m=0.03``
-or ``--aruco.marker_edge_length_m 0.03`` depending on the CLI layer.
+The pipeline is **MASt3R-SfM** only (images → dense cloud + ArUco 2D/3D). Optional
+``pose_dir`` and ``camera_params_dir`` are supported when available.
+
+CLI overrides use dotted paths, e.g. ``--set aruco.marker_edge_length_m=0.03``.
 """
 
 from __future__ import annotations
@@ -26,9 +28,6 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .aruco import ARUCO_DICTIONARIES
-
-
-Backend = Literal["vggt", "mast3r"]
 
 
 class InputConfig(BaseModel):
@@ -62,6 +61,13 @@ class OutputConfig(BaseModel):
     update_most_recent_symlink: bool = Field(
         default=True,
         description="Create/refresh a 'most-recent' symlink inside `root` after each run.",
+    )
+    z_axis_points_down: bool = Field(
+        default=True,
+        description=(
+            "If true, negate world +Z in all exports and Rerun so the vertical axis **increases downward** "
+            "(Z toward the ground) instead of a typical ENU/graphics +Z up convention."
+        ),
     )
 
 
@@ -108,6 +114,85 @@ class ArucoConfig(BaseModel):
         gt=0.0,
         description="Thickness/size multiplier for annotation drawings.",
     )
+    # Joint marker+camera bundle adjustment. Enforces rigid-square ArUco corners
+    # (known edge length) and refines per-view camera poses so every detected
+    # 2D corner reprojects to the stable 3D corner. Refined poses + scale are
+    # propagated to the back-end's point maps (per-view) and the fused cloud is
+    # regenerated, keeping the cloud, cameras, and markers mutually consistent.
+    bundle_adjustment: bool = Field(
+        default=True,
+        description=(
+            "Replace independent DLT triangulation with joint bundle "
+            "adjustment over (marker 6-DoF, camera SE(3), metric scale). "
+            "Required for ArUco 3D stability across views."
+        ),
+    )
+    ba_max_iters: int = Field(
+        default=300,
+        ge=1,
+        description="Max Adam iterations for the marker+camera bundle adjustment.",
+    )
+    ba_lr: float = Field(
+        default=5e-3,
+        gt=0.0,
+        description="Adam learning rate for the marker+camera bundle adjustment.",
+    )
+    ba_huber_delta_px: float = Field(
+        default=2.0,
+        gt=0.0,
+        description="Huber threshold on per-corner reprojection error, in pixels.",
+    )
+    ba_cam_prior_sigma_m: float = Field(
+        default=0.10,
+        gt=0.0,
+        description=(
+            "Soft Gaussian prior on per-view camera-center displacement "
+            "(meters). Keeps the BA anchored to the back-end's initial poses "
+            "when marker coverage is sparse; set larger if back-end poses are "
+            "expected to be far off."
+        ),
+    )
+    ba_cam_prior_sigma_deg: float = Field(
+        default=5.0,
+        gt=0.0,
+        description=(
+            "Soft Gaussian prior on per-view camera rotation delta "
+            "(degrees). Same role as `ba_cam_prior_sigma_m` for rotations."
+        ),
+    )
+    # Drop outlier views after alignment using per-image marker reprojection RMSE.
+    reject_views_by_alignment_error: bool = Field(
+        default=False,
+        description=(
+            "After ArUco alignment, remove any view whose per-view corner "
+            "reprojection RMSE exceeds `max_view_alignment_reproj_rmse_px`. "
+            "The fused cloud, surface, saved poses, and Rerun cameras are "
+            "rebuilt on kept views only (original indices recorded in metadata)."
+        ),
+    )
+    max_view_alignment_reproj_rmse_px: float = Field(
+        default=15.0,
+        gt=0.0,
+        description=(
+            "Per-view RMSE threshold (pixels) for `reject_views_by_alignment_error`. "
+            "Only views with at least one marker observation get a finite RMSE."
+        ),
+    )
+    min_kept_views: int = Field(
+        default=2,
+        ge=2,
+        description=(
+            "Minimum number of views to keep; if rejection would go below this, "
+            "all views are kept and a warning is printed."
+        ),
+    )
+    reject_views_with_no_markers: bool = Field(
+        default=False,
+        description=(
+            "When true, also reject views with no ArUco detections (RMSE undefined). "
+            "Default false: those views still contribute dense geometry."
+        ),
+    )
 
     @field_validator("dictionary")
     @classmethod
@@ -143,36 +228,44 @@ class SurfaceConfig(BaseModel):
     )
 
 
-class VggtConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    model_name: str = Field(default="facebook/VGGT-1B")
-    image_size: int = Field(default=518, ge=64)
-    conf_thres: float = Field(
-        default=50.0,
-        ge=0.0,
-        le=100.0,
-        description="Confidence percentile used to filter VGGT points.",
-    )
-    cloud_source: Literal["depth_map", "point_map"] = Field(default="depth_map")
-    camera_source: Literal["predicted", "gt"] = Field(
-        default="predicted",
-        description=(
-            "When GT poses are available, 'gt' applies a pred->GT Sim3 so the "
-            "cloud lives in the GT frame before ArUco alignment."
-        ),
-    )
-    alignment_mode: Literal["sim3", "se3"] = Field(default="sim3")
-    mask_black_bg: bool = Field(default=False)
-    mask_white_bg: bool = Field(default=False)
-
-
 class Mast3rConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     model_name: str = Field(
         default="naver/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric"
     )
+    pipeline_variant: Literal["dense", "sfm"] = Field(
+        default="sfm",
+        description=(
+            "'dense' uses the DUSt3R modular global alignment path. "
+            "'sfm' runs MASt3R-SfM (make_pairs + sparse_global_alignment)."
+        ),
+    )
+    scene_graph: str = Field(
+        default="auto",
+        description=(
+            "MASt3R-SfM scene graph. 'auto' picks 'complete' for <40 images, "
+            "else 'swin-5'. Explicit examples: 'complete', 'swin-5', "
+            "'logwin-3', 'retrieval-20-1'."
+        ),
+    )
+    retrieval_model: str | None = Field(
+        default=None,
+        description=(
+            "Optional retrieval checkpoint for retrieval-based MASt3R-SfM "
+            "pairing; required when scene_graph contains 'retrieval'."
+        ),
+    )
+    sfm_subsample: int = Field(default=4, ge=1)
+    sfm_lr1: float = Field(default=0.07, gt=0.0)
+    sfm_niter1: int = Field(default=300, ge=0)
+    sfm_lr2: float = Field(default=0.01, gt=0.0)
+    sfm_niter2: int = Field(default=300, ge=0)
+    sfm_opt_depth: bool = Field(default=True)
+    sfm_shared_intrinsics: bool = Field(default=True)
+    sfm_matching_conf_thr: float = Field(default=5.0, ge=0.0)
+    sfm_min_conf_thr: float = Field(default=1.5, ge=0.0)
+    sfm_clean_depth: bool = Field(default=True)
     image_size: int = Field(default=512, ge=64)
     neighbor_window: int = Field(default=2, ge=1)
     desc_conf_thr: float = Field(default=0.1, ge=0.0)
@@ -201,6 +294,68 @@ class RerunConfig(BaseModel):
     enabled: bool = Field(default=True)
     grpc_port: int = Field(default=9876, ge=1, le=65535)
     no_wait: bool = Field(default=False, description="Do not block on user input after logging.")
+    log_cloud_rgb: bool = Field(default=True, description="Log fused RGB cloud under /points.")
+    log_cloud_confidence: bool = Field(
+        default=True,
+        description="Log confidence-colored cloud under /points_confidence.",
+    )
+    log_cameras: bool = Field(default=True, description="Log camera transforms + pinhole models.")
+    log_camera_aruco_images: bool = Field(
+        default=True,
+        description="Log per-camera ArUco-annotated images under /cameras/*/image/aruco.",
+    )
+    log_camera_confidence_images: bool = Field(
+        default=True,
+        description="Log per-camera confidence images under /cameras/*/image/confidence.",
+    )
+    log_aruco_3d: bool = Field(default=True, description="Log aligned 3D ArUco markers and plane.")
+    log_surface_mesh: bool = Field(default=True, description="Log reconstructed mesh under /surface/mesh.")
+    log_surface_cloud_open3d_web: bool = Field(
+        default=False,
+        description=(
+            "Also open the reconstructed surface point cloud in Open3D's web visualizer "
+            "(uses `open3d.visualization.draw`)."
+        ),
+    )
+    open3d_web_visualizer_port: int = Field(
+        default=8888,
+        ge=1,
+        le=65535,
+        description=(
+            "Port for the Open3D web visualizer when enabled. Applied by setting the "
+            "`WEBRTC_PORT` environment variable before `open3d.visualization.draw`."
+        ),
+    )
+    open3d_web_show_ui: bool = Field(
+        default=True,
+        description="Whether to show Open3D's UI controls in the web visualizer.",
+    )
+    pointcloud_resample_factor: float = Field(
+        default=1.0,
+        gt=0.0,
+        le=1.0,
+        description="Fraction of cloud points to log to Rerun (1.0 logs all points).",
+    )
+    save_rrd: bool = Field(
+        default=True,
+        description="If true, stream the recording to a .rrd file (usually under the run’s rerun/ folder).",
+    )
+    save_rbl: bool = Field(
+        default=True,
+        description="If true, save the viewer layout blueprint as .rbl next to the .rrd (requires rerun-sdk with Blueprint.save).",
+    )
+    rerun_subdir: str = Field(
+        default="rerun",
+        description="Subfolder under the run output for .rrd and .rbl when saving.",
+    )
+    rrd_basename: str = Field(
+        default="spectra.rrd",
+        description="Rerun recording file name; should end in .rrd.",
+    )
+    rbl_basename: str = Field(
+        default="spectra.rbl",
+        description="Rerun blueprint file name; should end in .rbl.",
+    )
 
 
 class ReconstructionConfig(BaseModel):
@@ -210,10 +365,8 @@ class ReconstructionConfig(BaseModel):
 
     input: InputConfig
     output: OutputConfig = Field(default_factory=OutputConfig)
-    backend: Backend = Field(default="vggt")
     aruco: ArucoConfig = Field(default_factory=ArucoConfig)
     surface: SurfaceConfig = Field(default_factory=SurfaceConfig)
-    vggt: VggtConfig = Field(default_factory=VggtConfig)
     mast3r: Mast3rConfig = Field(default_factory=Mast3rConfig)
     rerun: RerunConfig = Field(default_factory=RerunConfig)
 
@@ -239,7 +392,7 @@ class ReconstructionConfig(BaseModel):
 
             cfg.with_overrides({
                 "aruco.marker_edge_length_m": 0.03,
-                "backend": "mast3r",
+                "mast3r.voxel_size": 0.002,
             })
         """
         base = copy.deepcopy(self.model_dump(mode="python"))
@@ -302,14 +455,12 @@ def save_config_json(cfg: ReconstructionConfig, path: str | Path) -> Path:
 
 __all__ = [
     "ArucoConfig",
-    "Backend",
     "InputConfig",
     "Mast3rConfig",
     "OutputConfig",
     "ReconstructionConfig",
     "RerunConfig",
     "SurfaceConfig",
-    "VggtConfig",
     "load_config",
     "save_config",
     "save_config_json",

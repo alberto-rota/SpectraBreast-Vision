@@ -15,7 +15,8 @@ from typing import List
 import cv2
 import numpy as np
 import torch
-import torchvision.io as tv_io
+from PIL import Image
+from PIL.ImageOps import exif_transpose
 
 from ..config import Mast3rConfig, ReconstructionConfig
 from .types import BackendInputs, RawReconstruction
@@ -524,8 +525,245 @@ def _ensure_mast3r_on_path() -> None:
         sys.path.append(str(mast3r_root))
 
 
+def _read_image_rgb_with_exif(path: Path) -> torch.Tensor:
+    """Load image as uint8 CHW tensor, matching MASt3R EXIF handling."""
+    with Image.open(path) as pil_img:
+        rgb = exif_transpose(pil_img).convert("RGB")
+        arr = np.asarray(rgb, dtype=np.uint8)  # [H, W, 3]
+    return torch.from_numpy(np.transpose(arr, (2, 0, 1)))  # [3, H, W]
+
+
+def _pad_view_maps_for_stacking(
+    point_map_world: List[np.ndarray],
+    valid_masks: List[np.ndarray],
+    images_network_uint8: List[np.ndarray],
+    confidence_maps_network: List[np.ndarray],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Pad per-view maps to a common [V, Hmax, Wmax, ...] shape.
+
+    Mixed portrait/landscape inputs can produce heterogeneous network shapes.
+    We pad each view to the global max shape and keep padded regions invalid.
+    """
+    max_h = max(int(mask.shape[0]) for mask in valid_masks)
+    max_w = max(int(mask.shape[1]) for mask in valid_masks)
+
+    point_map_world_np = np.full((len(point_map_world), max_h, max_w, 3), np.nan, dtype=np.float32)
+    valid_masks_np = np.zeros((len(valid_masks), max_h, max_w), dtype=bool)
+    images_net_np = np.zeros((len(images_network_uint8), max_h, max_w, 3), dtype=np.uint8)
+    conf_maps_np = np.zeros((len(confidence_maps_network), max_h, max_w), dtype=np.float32)
+
+    for idx, (pts, mask, rgb, conf) in enumerate(
+        zip(point_map_world, valid_masks, images_network_uint8, confidence_maps_network)
+    ):
+        h, w = int(mask.shape[0]), int(mask.shape[1])
+        point_map_world_np[idx, :h, :w, :] = pts.astype(np.float32, copy=False)
+        valid_masks_np[idx, :h, :w] = mask.astype(bool, copy=False)
+        images_net_np[idx, :h, :w, :] = rgb.astype(np.uint8, copy=False)
+        conf_maps_np[idx, :h, :w] = conf.astype(np.float32, copy=False)
+
+    return point_map_world_np, valid_masks_np, images_net_np, conf_maps_np
+
+
+def _resolve_scene_graph(scene_graph: str, num_views: int) -> str:
+    sg = scene_graph.strip().lower()
+    if sg != "auto":
+        return scene_graph
+    return "complete" if num_views < 40 else "swin-5"
+
+
+def _run_mast3r_sfm(cfg: ReconstructionConfig, inputs: BackendInputs) -> RawReconstruction:
+    _ensure_mast3r_on_path()
+    import mast3r.utils.path_to_dust3r  # noqa: F401
+    from dust3r.utils.image import load_images
+    from mast3r.cloud_opt.sparse_ga import sparse_global_alignment
+    from mast3r.image_pairs import make_pairs
+    from mast3r.model import AsymmetricMASt3R
+
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    image_paths = inputs.image_paths
+    num_views = len(image_paths)
+    if num_views < 2:
+        raise RuntimeError("MASt3R-SfM backend needs at least two images.")
+
+    mcfg: Mast3rConfig = cfg.mast3r
+    filelist = [str(path) for path in image_paths]
+    orig_images = [_read_image_rgb_with_exif(path) for path in image_paths]  # [3, H, W] uint8
+
+    model = AsymmetricMASt3R.from_pretrained(mcfg.model_name).to(device)
+    model.eval()
+    patch_size = int(getattr(model, "patch_size", 16))
+    imgs_mast3r = load_images(filelist, size=mcfg.image_size, verbose=True, patch_size=patch_size)
+    geometries = [
+        _compute_image_geometry(image, image_size=mcfg.image_size, patch_size=patch_size, square_ok=False)
+        for image in orig_images
+    ]
+
+    scene_graph = _resolve_scene_graph(mcfg.scene_graph, num_views)
+    sim_matrix = None
+    if "retrieval" in scene_graph:
+        if not mcfg.retrieval_model:
+            raise RuntimeError(
+                "MASt3R-SfM retrieval scene graph requires mast3r.retrieval_model to be set."
+            )
+        from mast3r.retrieval.processor import Retriever
+
+        try:
+            retriever = Retriever(mcfg.retrieval_model, backbone=model, device=str(device))
+        except TypeError:
+            retriever = Retriever(mcfg.retrieval_model, backbone=model)
+        with torch.no_grad():
+            sim_matrix = retriever(filelist)
+        del retriever
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    pairs = make_pairs(
+        imgs_mast3r,
+        scene_graph=scene_graph,
+        prefilter=None,
+        symmetrize=True,
+        sim_mat=sim_matrix,
+    )
+    if len(pairs) == 0:
+        raise RuntimeError(f"MASt3R-SfM produced no pairs for scene_graph={scene_graph!r}.")
+
+    cache_dir = Path(cfg.output.root) / ".mast3r_sfm_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    scene = sparse_global_alignment(
+        filelist,
+        pairs,
+        str(cache_dir),
+        model,
+        subsample=mcfg.sfm_subsample,
+        lr1=mcfg.sfm_lr1,
+        niter1=mcfg.sfm_niter1,
+        lr2=mcfg.sfm_lr2,
+        niter2=mcfg.sfm_niter2,
+        opt_depth=mcfg.sfm_opt_depth,
+        shared_intrinsics=mcfg.sfm_shared_intrinsics,
+        matching_conf_thr=mcfg.sfm_matching_conf_thr,
+        device=str(device),
+    )
+
+    with torch.no_grad():
+        poses_np = scene.get_im_poses().detach().cpu().numpy().astype(np.float32)
+        # MASt3R-SfM returns a SparseGA object (no get_intrinsics() method).
+        # Use its explicit intrinsics field, and keep a fallback for future API changes.
+        if hasattr(scene, "intrinsics"):
+            intrinsics_np = scene.intrinsics.detach().cpu().numpy().astype(np.float32)
+        elif hasattr(scene, "get_intrinsics"):
+            intrinsics_np = scene.get_intrinsics().detach().cpu().numpy().astype(np.float32)
+        else:
+            raise RuntimeError(
+                "MASt3R-SfM scene does not expose intrinsics (expected `intrinsics` or `get_intrinsics`)."
+            )
+        pts3d_list, _depth_list, conf_list = scene.get_dense_pts3d(
+            clean_depth=mcfg.sfm_clean_depth,
+            subsample=mcfg.sfm_subsample,
+        )
+
+    all_pts_list: List[np.ndarray] = []
+    all_cols_list: List[np.ndarray] = []
+    all_conf_list: List[np.ndarray] = []
+    valid_masks: List[np.ndarray] = []
+    point_map_world: List[np.ndarray] = []
+    images_network_uint8: List[np.ndarray] = []
+    confidence_maps_network: List[np.ndarray] = []
+
+    for pts3d_t, conf_t, geom, image in zip(pts3d_list, conf_list, geometries, orig_images):
+        conf_map = conf_t.detach().cpu().numpy().astype(np.float32)
+        Hn, Wn = int(conf_map.shape[0]), int(conf_map.shape[1])
+        pts3d = pts3d_t.detach().cpu().numpy().astype(np.float32).reshape(Hn, Wn, 3)
+
+        rgb_orig = image.permute(1, 2, 0).cpu().numpy().astype(np.uint8)
+        uu_orig, vv_orig = geom.network_grid_to_original()
+        u_idx = np.clip(np.round(uu_orig).astype(np.int32), 0, geom.original_width - 1)
+        v_idx = np.clip(np.round(vv_orig).astype(np.int32), 0, geom.original_height - 1)
+        cols_full = rgb_orig[v_idx, u_idx].astype(np.uint8)
+
+        valid = (conf_map >= float(mcfg.sfm_min_conf_thr)) & np.isfinite(pts3d).all(axis=-1)
+        if not np.any(valid):
+            valid = (conf_map > 0) & np.isfinite(pts3d).all(axis=-1)
+
+        all_pts_list.append(pts3d[valid].astype(np.float32))
+        all_cols_list.append(cols_full[valid].astype(np.uint8))
+        all_conf_list.append(conf_map[valid].astype(np.float32))
+        valid_masks.append(valid)
+        point_map_world.append(pts3d)
+        images_network_uint8.append(cols_full)
+        confidence_maps_network.append(conf_map)
+
+    if not any(len(p) > 0 for p in all_pts_list):
+        raise RuntimeError("MASt3R-SfM dense extraction produced no valid points.")
+
+    fused_points = np.concatenate(all_pts_list, axis=0)
+    fused_colors = np.concatenate(all_cols_list, axis=0)
+    fused_confidence = np.concatenate(all_conf_list, axis=0)
+
+    if mcfg.voxel_size > 0.0:
+        fused_points, fused_colors, fused_confidence = _weighted_voxel_downsample(
+            fused_points, fused_colors, fused_confidence, mcfg.voxel_size
+        )
+    if len(fused_points) > mcfg.max_points:
+        keep = np.argsort(fused_confidence)[-mcfg.max_points:][::-1]
+        fused_points = fused_points[keep]
+        fused_colors = fused_colors[keep]
+        fused_confidence = fused_confidence[keep]
+
+    point_map_world_np, valid_masks_np, images_net_np, conf_maps_np = _pad_view_maps_for_stacking(
+        point_map_world=point_map_world,
+        valid_masks=valid_masks,
+        images_network_uint8=images_network_uint8,
+        confidence_maps_network=confidence_maps_network,
+    )
+    K_net_per_view = intrinsics_np.astype(np.float32)
+    K_orig_per_view = np.stack(
+        [geom.network_to_original_intrinsics(K_net_per_view[i]) for i, geom in enumerate(geometries)],
+        axis=0,
+    ).astype(np.float32)
+    network_image_sizes = np.asarray(
+        [[g.network_width, g.network_height] for g in geometries], dtype=np.int32
+    )
+    original_image_sizes = np.asarray(
+        [[g.original_width, g.original_height] for g in geometries], dtype=np.int32
+    )
+
+    return RawReconstruction(
+        fused_points=fused_points,
+        fused_colors=fused_colors,
+        fused_confidence=fused_confidence,
+        point_map_world=point_map_world_np,
+        valid_masks=valid_masks_np,
+        T_world_cam=poses_np,
+        K_per_view_orig=K_orig_per_view,
+        K_per_view_network=K_net_per_view,
+        network_image_sizes=network_image_sizes,
+        original_image_sizes=original_image_sizes,
+        images_network_uint8=images_net_np,
+        confidence_maps_network=conf_maps_np,
+        frame_description="sfm",
+        backend_name="mast3r",
+        alignment_info={
+            "pipeline_variant": "sfm",
+            "scene_graph": scene_graph,
+        },
+        extra={
+            "pipeline_variant": "sfm",
+            "scene_graph": scene_graph,
+            "num_pairs": len(pairs),
+        },
+    )
+
+
 def run_mast3r(cfg: ReconstructionConfig, inputs: BackendInputs) -> RawReconstruction:
     """Run MASt3R pair inference + global alignment + dense fusion."""
+    mcfg: Mast3rConfig = cfg.mast3r
+    if mcfg.pipeline_variant == "sfm":
+        return _run_mast3r_sfm(cfg, inputs)
+
     _ensure_mast3r_on_path()
     import mast3r.utils.path_to_dust3r  # noqa: F401
     from dust3r.cloud_opt import GlobalAlignerMode, global_aligner
@@ -548,9 +786,7 @@ def run_mast3r(cfg: ReconstructionConfig, inputs: BackendInputs) -> RawReconstru
     have_gt_intrinsics = inputs.K_orig_gt is not None
     K_orig = inputs.K_orig_gt
 
-    mcfg: Mast3rConfig = cfg.mast3r
-
-    orig_images = [tv_io.read_image(str(path)) for path in image_paths]  # [3, H, W] uint8
+    orig_images = [_read_image_rgb_with_exif(path) for path in image_paths]  # [3, H, W] uint8
 
     model = AsymmetricMASt3R.from_pretrained(mcfg.model_name).to(device)
     model.eval()
@@ -715,10 +951,12 @@ def run_mast3r(cfg: ReconstructionConfig, inputs: BackendInputs) -> RawReconstru
         fused_colors = fused_colors[keep]
         fused_confidence = fused_confidence[keep]
 
-    valid_masks_np = np.stack(valid_masks, axis=0)
-    point_map_world_np = np.stack(point_map_world, axis=0)
-    images_net_np = np.stack(images_network_uint8, axis=0)
-    conf_maps_np = np.stack(confidence_maps_network, axis=0)
+    point_map_world_np, valid_masks_np, images_net_np, conf_maps_np = _pad_view_maps_for_stacking(
+        point_map_world=point_map_world,
+        valid_masks=valid_masks,
+        images_network_uint8=images_network_uint8,
+        confidence_maps_network=confidence_maps_network,
+    )
     K_net_per_view = np.stack(K_network, axis=0).astype(np.float32)
 
     if have_gt_intrinsics:

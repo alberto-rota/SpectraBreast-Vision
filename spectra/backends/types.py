@@ -51,7 +51,7 @@ class RawReconstruction:
     images_network_uint8: np.ndarray      # [V, Hn, Wn, 3] uint8
     confidence_maps_network: np.ndarray   # [V, Hn, Wn] float32
     frame_description: str                # 'predicted' | 'gt' | 'gt-aligned'
-    backend_name: str                     # 'vggt' | 'mast3r'
+    backend_name: str                     # 'mast3r'
     alignment_info: dict | None = None    # backend-specific pred->GT Sim3 info
     extra: dict[str, Any] = field(default_factory=dict)
 

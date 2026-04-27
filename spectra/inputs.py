@@ -12,10 +12,12 @@ from typing import List
 
 import numpy as np
 import torch
+from PIL import Image
+from PIL.ImageOps import exif_transpose
 
 from .aruco import IMAGE_EXTENSIONS
 from .backends import BackendInputs
-from .helpers_bridge import xyzeuler_to_hmat
+from .transforms import xyzeuler_to_hmat
 
 
 def list_rgb_images(rgb_dir: Path) -> List[Path]:
@@ -30,6 +32,45 @@ def list_rgb_images(rgb_dir: Path) -> List[Path]:
     if not files:
         raise FileNotFoundError(f"No image files found in {rgb_dir}")
     return files
+
+
+def canonicalize_images_with_exif(
+    image_paths: List[Path],
+    cache_dir: Path,
+) -> List[Path]:
+    """Bake EXIF orientation into pixel buffers and write to ``cache_dir``.
+
+    iPhones and other cameras often store photos in a fixed sensor orientation
+    and use the EXIF ``Orientation`` tag to tell viewers how to rotate/flip
+    them for correct display. ``cv2.imread`` / ``torchvision.io.read_image`` /
+    ``PIL.Image.open`` all ignore that tag by default, so without this step
+    downstream code sees raw buffers that may be upside-down or mirrored.
+
+    Mixed orientations break dense-prediction MASt3R (and similar) models whose
+    pose heads assume upright, non-mirrored images. Applying EXIF upfront
+    guarantees every consumer (back-end, ArUco detector, Rerun, TUI) works in
+    the same image frame.
+
+    The output directory is cleared before writing, and paths are preserved
+    in the same sorted order as ``image_paths``.
+    """
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    for existing in cache_dir.iterdir():
+        if existing.is_file():
+            existing.unlink()
+
+    canonical_paths: List[Path] = []
+    for src in image_paths:
+        # Reserve the sidecar .png extension for everything so we don't have
+        # to deal with lossy re-encoding of JPEG->JPEG (which would change
+        # pixel values and invalidate ArUco subpixel positions).
+        dst = cache_dir / (src.stem + ".png")
+        with Image.open(src) as pil_img:
+            canonical = exif_transpose(pil_img).convert("RGB")
+            canonical.save(dst, format="PNG", compress_level=1)
+        canonical_paths.append(dst)
+    return canonical_paths
 
 
 def _fix_3x4_to_4x4(T: np.ndarray) -> np.ndarray:
@@ -128,6 +169,7 @@ def build_backend_inputs(
 
 __all__ = [
     "build_backend_inputs",
+    "canonicalize_images_with_exif",
     "list_rgb_images",
     "load_gt_cameras",
 ]
