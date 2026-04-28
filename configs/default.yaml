@@ -3,13 +3,13 @@
 # Output: fused `cloud.ply`, ArUco 2D under `aruco_detections/`, 3D in `aruco_markers_3d.json` when aligned.
 
 input:
-  rgb_dir: DATA/SAMPLE0_iphone/rgb
+  rgb_dir: DATA/SAMPLE1_iphone/rgb
   pose_dir: null
   camera_params_dir: null
 
 output:
   root: RESULTS
-  run_name: SAMPLE0
+  run_name: SCRAP
   update_most_recent_symlink: true
   z_axis_points_down: true
 

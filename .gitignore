@@ -6,8 +6,8 @@
 *.npz
 *.ply
 *.ckpt
-*.egg-info/
-__pycache__/
+*.egg-info
+__pycache__
 
 DATA/
 RESULTS/
